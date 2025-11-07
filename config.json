@@ -1,0 +1,12 @@
+{
+  "timezone": "US/Eastern",
+  "min_confidence": 65,
+  "entry_window_start": "09:30",
+  "entry_window_end": "10:00",
+  "forced_exit_time": "15:30",
+  "entry_price_buffer": 0.001,
+  "trailing_stop_pct": 0.02,
+  "poll_interval_seconds": 60,
+  "default_quantity": 100,
+  "symbols": ["TNA", "TZA"]
+}
