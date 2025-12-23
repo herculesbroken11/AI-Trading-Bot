@@ -58,7 +58,14 @@ Create a `.env` file in the repository root (see [Environment Variables](#-envir
 Run the API locally:
 
 ```bash
-uvicorn backend.main:app --reload --port 8000
+cd backend
+python -m flask run --host=0.0.0.0 --port=8000
+```
+
+Or using Python directly:
+
+```bash
+python -m backend.main
 ```
 
 ### 2. Frontend
@@ -117,7 +124,7 @@ TASTYTRADE_CLIENT_SECRET=your_client_secret
 TASTYTRADE_REDIRECT_URI=https://localhost
 ALPHAVANTAGE_API_KEY=BAK0PFQWV70EANSC
 OPENAI_API_KEY=sk-your-openai-key
-DATABASE_URL=sqlite+aiosqlite:///tradebot.db
+DATABASE_URL=postgresql://user:password@localhost:5432/tradebot
 TASTYTRADE_ENV=sandbox
 TRADING_BOT_CONFIG=config.json
 ```
@@ -139,9 +146,10 @@ TRADING_BOT_CONFIG=config.json
 
 ## 🔧 Development Tips
 
-- FastAPI auto-reloads with `--reload`; interactive docs at `http://localhost:8000/docs`
+- Flask auto-reloads in debug mode; run with `flask run --debug` for development
 - Tailwind + Vite hot reload the React UI (`npm run dev`)
 - Update `config.json` to experiment with different thresholds without code changes
+- Make sure PostgreSQL is running and the database exists before starting the app
 
 ## ⚠️ Operational Notes
 

@@ -9,9 +9,9 @@ class AlphaVantageDataFeed:
         self.api_key = os.getenv("ALPHAVANTAGE_API_KEY", "BAK0PFQWV70EANSC")
         self.base_url = "https://www.alphavantage.co/query"
 
-    async def fetch_intraday(self, symbol: str, interval: str = "1min", outputsize: str = "compact") -> pd.DataFrame:
+    def fetch_intraday(self, symbol: str, interval: str = "1min", outputsize: str = "compact") -> pd.DataFrame:
         """Fetch intraday data for a symbol and enrich with indicators"""
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0) as client:
             params = {
                 "function": "TIME_SERIES_INTRADAY",
                 "symbol": symbol,
@@ -19,7 +19,7 @@ class AlphaVantageDataFeed:
                 "apikey": self.api_key,
                 "outputsize": outputsize
             }
-            response = await client.get(self.base_url, params=params)
+            response = client.get(self.base_url, params=params)
             response.raise_for_status()
             data = response.json()
 
@@ -41,16 +41,16 @@ class AlphaVantageDataFeed:
             self._augment_intraday(df)
             return df
 
-    async def fetch_daily(self, symbol: str, outputsize: str = "compact") -> pd.DataFrame:
+    def fetch_daily(self, symbol: str, outputsize: str = "compact") -> pd.DataFrame:
         """Fetch daily adjusted data for long-term trend analysis"""
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0) as client:
             params = {
                 "function": "TIME_SERIES_DAILY_ADJUSTED",
                 "symbol": symbol,
                 "apikey": self.api_key,
                 "outputsize": outputsize
             }
-            response = await client.get(self.base_url, params=params)
+            response = client.get(self.base_url, params=params)
             response.raise_for_status()
             data = response.json()
 
@@ -83,15 +83,15 @@ class AlphaVantageDataFeed:
             df["rolling_volume"] = df["volume"].rolling(20).mean()
             return df
 
-    async def fetch_quote(self, symbol: str) -> Dict:
+    def fetch_quote(self, symbol: str) -> Dict:
         """Fetch current quote"""
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0) as client:
             params = {
                 "function": "GLOBAL_QUOTE",
                 "symbol": symbol,
                 "apikey": self.api_key
             }
-            response = await client.get(self.base_url, params=params)
+            response = client.get(self.base_url, params=params)
             response.raise_for_status()
             data = response.json()
 
@@ -139,7 +139,64 @@ class AlphaVantageDataFeed:
         df["volatility_10"] = df["close"].pct_change().rolling(10).std()
         df["momentum_15"] = df["close"].pct_change(15)
         df["typical_price"] = typical_price
+        
+        # Hourly aggregation for volume and money flow analysis
+        if not df.empty:
+            df["hour"] = df.index.hour
+            try:
+                df["hourly_volume"] = df.groupby("hour")["volume"].transform("sum")
+                df["hourly_money_flow"] = df.groupby("hour")["money_flow_volume"].transform("sum")
+            except Exception:
+                # Fallback if grouping fails
+                df["hourly_volume"] = df["volume"]
+                df["hourly_money_flow"] = df["money_flow_volume"]
+            
+            # Money flow direction indicator (positive = money entering, negative = money leaving)
+            df["money_flow_direction"] = df["money_flow_volume"].apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
 
         df.fillna(method="bfill", inplace=True)
         df.fillna(method="ffill", inplace=True)
+    
+    def analyze_hourly_trends(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze hourly volume and money flow trends for exit decisions"""
+        recent = df.tail(60)  # Last 60 minutes
+        
+        # Current hour analysis
+        current_hour = recent.index[-1].hour
+        current_hour_data = recent[recent["hour"] == current_hour]
+        
+        # Previous hour for comparison
+        prev_hour = current_hour - 1 if current_hour > 0 else 23
+        prev_hour_data = recent[recent["hour"] == prev_hour]
+        
+        # Money flow analysis
+        current_money_flow = current_hour_data["money_flow_volume"].sum() if not current_hour_data.empty else 0
+        prev_money_flow = prev_hour_data["money_flow_volume"].sum() if not prev_hour_data.empty else 0
+        
+        # Volume analysis
+        current_volume = current_hour_data["volume"].sum() if not current_hour_data.empty else 0
+        prev_volume = prev_hour_data["volume"].sum() if not prev_hour_data.empty else 0
+        
+        # Money flow direction
+        money_flow_trend = "entering" if current_money_flow > 0 else "leaving" if current_money_flow < 0 else "neutral"
+        money_flow_changing = "weakening" if abs(current_money_flow) < abs(prev_money_flow) * 0.7 else "strengthening" if abs(current_money_flow) > abs(prev_money_flow) * 1.3 else "stable"
+        
+        # Volume trend
+        volume_trend = "strengthening" if current_volume > prev_volume * 1.2 else "weakening" if current_volume < prev_volume * 0.8 else "stable"
+        
+        # Recent money flow momentum (last 15 minutes)
+        last_15_min = recent.tail(15)
+        money_flow_momentum = last_15_min["money_flow_volume"].mean()
+        
+        return {
+            "current_hour": int(current_hour),
+            "money_flow_entering": float(current_money_flow) if current_money_flow > 0 else 0.0,
+            "money_flow_leaving": float(abs(current_money_flow)) if current_money_flow < 0 else 0.0,
+            "money_flow_trend": money_flow_trend,
+            "money_flow_changing": money_flow_changing,
+            "volume_trend": volume_trend,
+            "volume_change_pct": float((current_volume / prev_volume - 1) * 100) if prev_volume > 0 else 0.0,
+            "money_flow_momentum": float(money_flow_momentum),
+            "should_exit_on_negative_flow": current_money_flow < 0 and money_flow_changing == "weakening"
+        }
 

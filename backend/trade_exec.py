@@ -6,13 +6,13 @@ class TradeExecutor:
     def __init__(self, auth: Optional[TastytradeAuth] = None):
         self.auth = auth or TastytradeAuth()
     
-    async def get_account_info(self) -> Dict:
+    def get_account_info(self) -> Dict:
         """Get account balance and positions"""
         if not self.auth.access_token:
             raise ValueError("Not authenticated")
         
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
+        with httpx.Client() as client:
+            response = client.get(
                 f"{self.auth.base_url}/accounts",
                 headers=self.auth.get_headers()
             )
@@ -24,7 +24,7 @@ class TradeExecutor:
                 account_number = account["account-number"]
                 
                 # Get account balance
-                balance_response = await client.get(
+                balance_response = client.get(
                     f"{self.auth.base_url}/accounts/{account_number}/balances",
                     headers=self.auth.get_headers()
                 )
@@ -39,12 +39,12 @@ class TradeExecutor:
                 }
             return {}
     
-    async def place_order(self, symbol: str, side: str, quantity: int = 1, order_type: str = "Market") -> Dict:
+    def place_order(self, symbol: str, side: str, quantity: int = 1, order_type: str = "Market") -> Dict:
         """Place an order via Tastytrade"""
         if not self.auth.access_token:
             raise ValueError("Not authenticated")
         
-        account_info = await self.get_account_info()
+        account_info = self.get_account_info()
         account_number = account_info.get("account_number")
         
         if not account_number:
@@ -63,8 +63,8 @@ class TradeExecutor:
             }]
         }
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
+        with httpx.Client() as client:
+            response = client.post(
                 f"{self.auth.base_url}/accounts/{account_number}/orders",
                 headers=self.auth.get_headers(),
                 json=order_data
@@ -72,17 +72,17 @@ class TradeExecutor:
             response.raise_for_status()
             return response.json()
     
-    async def close_position(self, symbol: str, quantity: Optional[int] = None) -> Dict:
+    def close_position(self, symbol: str, quantity: Optional[int] = None) -> Dict:
         """Close an open position"""
         if not self.auth.access_token:
             raise ValueError("Not authenticated")
         
-        account_info = await self.get_account_info()
+        account_info = self.get_account_info()
         account_number = account_info.get("account_number")
         
         # Get positions first
-        async with httpx.AsyncClient() as client:
-            positions_response = await client.get(
+        with httpx.Client() as client:
+            positions_response = client.get(
                 f"{self.auth.base_url}/accounts/{account_number}/positions",
                 headers=self.auth.get_headers()
             )
@@ -112,7 +112,7 @@ class TradeExecutor:
                 }]
             }
             
-            response = await client.post(
+            response = client.post(
                 f"{self.auth.base_url}/accounts/{account_number}/orders",
                 headers=self.auth.get_headers(),
                 json=order_data

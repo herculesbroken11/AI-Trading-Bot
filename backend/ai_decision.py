@@ -13,7 +13,7 @@ class AIDecisionEngine:
         self.client = OpenAI(api_key=api_key)
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    async def analyze_market(
+    def analyze_market(
         self,
         summaries: Dict[str, Dict[str, Any]],
         recent_data: Dict[str, pd.DataFrame],

@@ -1,4 +1,4 @@
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy import select
 from .database import Trade, AIPrediction, TrendSignal
 from typing import List, Optional, Dict, Any
@@ -6,8 +6,8 @@ from datetime import datetime
 
 class TradeLogger:
     @staticmethod
-    async def log_trade(
-        session: AsyncSession,
+    def log_trade(
+        session: Session,
         symbol: str,
         side: str,
         entry_price: float,
@@ -36,21 +36,20 @@ class TradeLogger:
             entry_time=entry_time or datetime.utcnow()
         )
         session.add(trade)
-        await session.commit()
-        await session.refresh(trade)
+        session.commit()
+        session.refresh(trade)
         return trade
 
     @staticmethod
-    async def update_trade_exit(
-        session: AsyncSession,
+    def update_trade_exit(
+        session: Session,
         trade_id: int,
         exit_price: float,
         exit_reason: str,
         partial_exit_pct: Optional[float] = None
     ) -> Trade:
         """Close a trade and calculate PnL"""
-        result = await session.execute(select(Trade).where(Trade.trade_id == trade_id))
-        trade = result.scalar_one_or_none()
+        trade = session.query(Trade).filter(Trade.trade_id == trade_id).first()
 
         if not trade:
             raise ValueError(f"Trade {trade_id} not found")
@@ -67,29 +66,23 @@ class TradeLogger:
         else:
             trade.pnl = (trade.entry_price - exit_price) * trade.quantity
 
-        await session.commit()
-        await session.refresh(trade)
+        session.commit()
+        session.refresh(trade)
         return trade
 
     @staticmethod
-    async def get_trades(session: AsyncSession, limit: int = 100) -> List[Trade]:
+    def get_trades(session: Session, limit: int = 100) -> List[Trade]:
         """Get recent trades"""
-        result = await session.execute(
-            select(Trade).order_by(Trade.created_at.desc()).limit(limit)
-        )
-        return result.scalars().all()
+        return session.query(Trade).order_by(Trade.created_at.desc()).limit(limit).all()
 
     @staticmethod
-    async def get_open_trades(session: AsyncSession) -> List[Trade]:
+    def get_open_trades(session: Session) -> List[Trade]:
         """Get all open trades"""
-        result = await session.execute(
-            select(Trade).where(Trade.status == "open")
-        )
-        return result.scalars().all()
+        return session.query(Trade).filter(Trade.status == "open").all()
 
     @staticmethod
-    async def log_prediction(
-        session: AsyncSession,
+    def log_prediction(
+        session: Session,
         symbol: str,
         analysis: Dict[str, Any],
         raw_response: str
@@ -107,13 +100,13 @@ class TradeLogger:
             analysis_json=raw_response
         )
         session.add(prediction)
-        await session.commit()
-        await session.refresh(prediction)
+        session.commit()
+        session.refresh(prediction)
         return prediction
 
     @staticmethod
-    async def log_trend_signal(
-        session: AsyncSession,
+    def log_trend_signal(
+        session: Session,
         symbol: str,
         macro_trend: str,
         seasonal_bias: Optional[str],
@@ -130,27 +123,25 @@ class TradeLogger:
             notes=notes
         )
         session.add(trend)
-        await session.commit()
-        await session.refresh(trend)
+        session.commit()
+        session.refresh(trend)
         return trend
 
     @staticmethod
-    async def update_trailing_stop(
-        session: AsyncSession,
+    def update_trailing_stop(
+        session: Session,
         trade_id: int,
         trailing_stop: float
     ) -> Trade:
-        result = await session.execute(select(Trade).where(Trade.trade_id == trade_id))
-        trade = result.scalar_one_or_none()
+        trade = session.query(Trade).filter(Trade.trade_id == trade_id).first()
         if not trade:
             raise ValueError(f"Trade {trade_id} not found")
         trade.trailing_stop = trailing_stop
-        await session.commit()
-        await session.refresh(trade)
+        session.commit()
+        session.refresh(trade)
         return trade
 
     @staticmethod
-    async def get_trade(session: AsyncSession, trade_id: int) -> Optional[Trade]:
-        result = await session.execute(select(Trade).where(Trade.trade_id == trade_id))
-        return result.scalar_one_or_none()
+    def get_trade(session: Session, trade_id: int) -> Optional[Trade]:
+        return session.query(Trade).filter(Trade.trade_id == trade_id).first()
 

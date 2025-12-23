@@ -150,18 +150,60 @@ class TradingStrategy:
                     indicators={**indicators, "pnl_pct": pnl_pct},
                 )
 
-        # Partial profit / early exit logic
+        # Enhanced Partial profit / early exit logic with hourly volume and money flow
         if 0 < pnl_pct < take_profit:
+            hourly_analysis = indicators.get("hourly_analysis", {})
             weakening_volume = indicators.get("volume_ratio", 1) < 0.9
             momentum_loss = indicators.get("momentum_change", 0) < 0 if side == "buy" else indicators.get("momentum_change", 0) > 0
             volatility_drop = indicators.get("volatility_change", 0) < -0.15
-            if pnl_pct >= early_exit_target and (weakening_volume or momentum_loss or volatility_drop):
+            
+            # Enhanced exit conditions using hourly analysis
+            money_leaving = hourly_analysis.get("money_flow_trend") == "leaving"
+            money_flow_weakening = hourly_analysis.get("money_flow_changing") == "weakening"
+            volume_weakening_hourly = hourly_analysis.get("volume_trend") == "weakening"
+            
+            # Calculate time since entry for time-based protection
+            entry_time = request_data.get("entry_time")
+            if entry_time:
+                if isinstance(entry_time, str):
+                    from dateutil import parser
+                    entry_time = parser.parse(entry_time)
+                time_since_entry = (now_et - entry_time).total_seconds() / 3600.0  # hours
+            else:
+                time_since_entry = 0.0
+            
+            # Enhanced exit conditions: use hourly volume/money flow analysis
+            should_exit = False
+            exit_reason = "early_profit_lock"
+            
+            # Priority 1: Money leaving market (strongest signal)
+            if money_leaving and money_flow_weakening and pnl_pct >= 0.005:  # Any positive gain
+                should_exit = True
+                exit_reason = "money_leaving_market_protection"
+            
+            # Priority 2: Volume weakening + money flow weakening
+            elif volume_weakening_hourly and money_flow_weakening and pnl_pct >= early_exit_target:
+                should_exit = True
+                exit_reason = "volume_money_flow_weakening"
+            
+            # Priority 3: Time-based protection (trade open for hours, protect gains)
+            elif time_since_entry >= 3.0 and pnl_pct >= 0.015:  # 3+ hours, 1.5%+ profit
+                if weakening_volume or momentum_loss or volatility_drop:
+                    should_exit = True
+                    exit_reason = "time_based_profit_protection"
+            
+            # Priority 4: Original conditions
+            elif pnl_pct >= early_exit_target and (weakening_volume or momentum_loss or volatility_drop):
+                should_exit = True
+                exit_reason = "early_profit_lock"
+            
+            if should_exit:
                 return ExitStrategyResponse(
                     action="exit",
                     exit_price=current_price,
-                    reason="early_profit_lock",
+                    reason=exit_reason,
                     trailing_stop=None,
-                    indicators={**indicators, "pnl_pct": pnl_pct},
+                    indicators={**indicators, "pnl_pct": pnl_pct, "time_since_entry_hours": time_since_entry},
                 )
 
         return ExitStrategyResponse(
@@ -207,6 +249,16 @@ class TradingStrategy:
         volatility_change = (volatility_series.iloc[-1] - volatility_series.mean()) / (volatility_series.mean() or 1)
         momentum_change = recent["close"].pct_change().tail(5).mean()
         money_flow = recent["money_flow_volume"].tail(10).sum()
+        
+        # Enhanced hourly analysis
+        # Create temporary instance for hourly analysis (or better: pass data_feed instance)
+        try:
+            from .data_feed import AlphaVantageDataFeed
+            temp_feed = AlphaVantageDataFeed()
+            hourly_analysis = temp_feed.analyze_hourly_trends(df)
+        except Exception:
+            # Fallback if analysis fails
+            hourly_analysis = {}
 
         return {
             "volume_ratio": float(volume_ratio),
@@ -214,5 +266,6 @@ class TradingStrategy:
             "momentum_change": float(momentum_change or 0),
             "money_flow": float(money_flow or 0),
             "last_price": float(latest["close"]),
+            "hourly_analysis": hourly_analysis,
         }
 

@@ -25,12 +25,12 @@ class TastytradeAuth:
         query_string = "&".join([f"{k}={v}" for k, v in params.items()])
         return f"{auth_url}?{query_string}"
     
-    async def exchange_code_for_token(self, code: str) -> Dict:
+    def exchange_code_for_token(self, code: str) -> Dict:
         """Exchange authorization code for access token"""
         auth_string = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
+        with httpx.Client() as client:
+            response = client.post(
                 f"{self.base_url}/oauth/token",
                 headers={
                     "Authorization": f"Basic {auth_string}",
@@ -48,12 +48,12 @@ class TastytradeAuth:
             self.refresh_token = data.get("refresh_token")
             return data
     
-    async def refresh_access_token(self) -> Dict:
+    def refresh_access_token(self) -> Dict:
         """Refresh access token using refresh token"""
         auth_string = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
+        with httpx.Client() as client:
+            response = client.post(
                 f"{self.base_url}/oauth/token",
                 headers={
                     "Authorization": f"Basic {auth_string}",
