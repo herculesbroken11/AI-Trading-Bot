@@ -8,5 +8,9 @@
   "trailing_stop_pct": 0.02,
   "poll_interval_seconds": 60,
   "default_quantity": 100,
-  "symbols": ["TNA", "TZA"]
+  "symbols": ["TNA", "TZA"],
+  "stop_loss_pct": 0.05,
+  "max_position_pct_of_buying_power": 0.25,
+  "min_buying_power_required": 5000,
+  "max_trades_per_day": 1
 }

@@ -16,6 +16,7 @@ from .trade_exec import TradeExecutor
 from .logger import TradeLogger
 from .database import SessionLocal
 from .models import AIAnalysisResponse
+from .capital_manager import calculate_position_size, should_allow_trade
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +108,51 @@ class TradingBotManager:
         if not entry_signal:
             return
 
+        # Capital management: follow available funds first, avoid overtrading
+        try:
+            account_info = self.trade_executor.get_account_info()
+            buying_power = float(account_info.get("buying_power") or account_info.get("balance") or 0)
+        except Exception as e:
+            logger.warning("Could not get account info for capital check: %s. Using default quantity.", e)
+            buying_power = 0  # Will use default if we can't check
+
+        max_trades = self.config.get("max_trades_per_day", 1)
+        trades_today = TradeLogger.count_trades_closed_today(session)
+        allow, allow_reason = should_allow_trade(
+            buying_power=buying_power if buying_power > 0 else 999999,  # Allow if we couldn't fetch
+            min_buying_power_required=self.config.get("min_buying_power_required", 5000),
+            has_open_position=bool(self.active_trade_id),
+            trades_today=trades_today,
+            max_trades_per_day=max_trades,
+        )
+        if not allow:
+            logger.info("Skipping trade (capital rules): %s", allow_reason)
+            return
+
+        quantity, size_reason = calculate_position_size(
+            buying_power=buying_power if buying_power > 0 else 100000,  # Fallback for paper mode
+            entry_price=entry_signal.entry_price,
+            default_quantity=self.config.get("default_quantity", 100),
+            max_position_pct=self.config.get("max_position_pct_of_buying_power", 0.25),
+            min_buying_power_required=self.config.get("min_buying_power_required", 5000),
+        )
+        if quantity <= 0:
+            logger.info("Skipping trade (position size): %s", size_reason)
+            return
+
+        if size_reason != "ok":
+            logger.info("Position size adjusted: %s", size_reason)
+
+        # Use config stop_loss (far enough to not trigger too often)
+        stop_loss = self.config.get("stop_loss_pct", 0.05)
+        if ai_response.stop_loss and ai_response.stop_loss > stop_loss:
+            stop_loss = ai_response.stop_loss  # Use AI value if it's wider
+
         # Execute trade via Tastytrade
         order = self.trade_executor.place_order(
             symbol=entry_signal.symbol,
             side=entry_signal.side,
-            quantity=self.config.get("default_quantity", 1)
+            quantity=quantity
         )
 
         trade = TradeLogger.log_trade(
@@ -119,11 +160,11 @@ class TradingBotManager:
             symbol=entry_signal.symbol,
             side=entry_signal.side,
             entry_price=entry_signal.entry_price,
-            quantity=self.config.get("default_quantity", 1),
+            quantity=quantity,
             confidence=entry_signal.confidence,
             take_profit=ai_response.take_profit,
             early_exit_target=ai_response.early_exit_profit,
-            stop_loss=ai_response.stop_loss,
+            stop_loss=stop_loss,
             trailing_stop=self.config.get("trailing_stop_pct") if ai_response.use_trailing_stop else None,
             ai_reasoning=entry_signal.rationale,
             entry_time=datetime.utcnow()

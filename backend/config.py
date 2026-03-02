@@ -13,6 +13,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_seconds": 60,
     "trailing_stop_pct": 0.02,
     "symbols": ["TNA", "TZA"],
+    "stop_loss_pct": 0.05,
+    "max_position_pct_of_buying_power": 0.25,
+    "min_buying_power_required": 5000,
+    "max_trades_per_day": 1,
 }
 
 CONFIG_ENV_KEY = "TRADING_BOT_CONFIG"

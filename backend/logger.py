@@ -81,6 +81,16 @@ class TradeLogger:
         return session.query(Trade).filter(Trade.status == "open").all()
 
     @staticmethod
+    def count_trades_closed_today(session: Session) -> int:
+        """Count closed trades today (for max_trades_per_day limit)"""
+        from datetime import date
+        today_start = datetime.combine(date.today(), datetime.min.time())
+        return session.query(Trade).filter(
+            Trade.status == "closed",
+            Trade.closed_at >= today_start
+        ).count()
+
+    @staticmethod
     def log_prediction(
         session: Session,
         symbol: str,

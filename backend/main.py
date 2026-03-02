@@ -31,6 +31,7 @@ from .trade_exec import TradeExecutor
 from .logger import TradeLogger
 from .config import load_config
 from .bot_manager import TradingBotManager
+from .capital_manager import calculate_position_size, should_allow_trade
 
 config = load_config()
 auth = TastytradeAuth()
@@ -165,24 +166,42 @@ def execute_trade():
         if not entry_signal:
             return jsonify({"detail": "Strategy conditions not met"}), 400
 
+        try:
+            account_info = trade_executor.get_account_info()
+            buying_power = float(account_info.get("buying_power") or account_info.get("balance") or 0)
+        except Exception:
+            buying_power = 100000
+
+        requested_qty = req.quantity or config.get("default_quantity", 1)
+        quantity, size_reason = calculate_position_size(
+            buying_power=buying_power,
+            entry_price=entry_signal.entry_price,
+            default_quantity=requested_qty,
+            max_position_pct=config.get("max_position_pct_of_buying_power", 0.25),
+            min_buying_power_required=config.get("min_buying_power_required", 5000),
+        )
+        if quantity <= 0:
+            return jsonify({"detail": f"Cannot trade: {size_reason}"}), 400
+        quantity = min(quantity, requested_qty)
+        stop_loss = max(config.get("stop_loss_pct", 0.05), analysis.stop_loss or 0.05)
+
         order = trade_executor.place_order(
             symbol=entry_signal.symbol,
             side=entry_signal.side,
-            quantity=req.quantity or config.get("default_quantity", 1)
+            quantity=quantity
         )
 
-        db = next(get_db())
         try:
             trade = TradeLogger.log_trade(
                 session=db,
                 symbol=entry_signal.symbol,
                 side=entry_signal.side,
                 entry_price=entry_signal.entry_price,
-                quantity=req.quantity or config.get("default_quantity", 1),
+                quantity=quantity,
                 confidence=entry_signal.confidence,
                 take_profit=analysis.take_profit,
                 early_exit_target=analysis.early_exit_profit,
-                stop_loss=analysis.stop_loss,
+                stop_loss=stop_loss,
                 trailing_stop=config.get("trailing_stop_pct") if analysis.use_trailing_stop else None,
                 ai_reasoning=entry_signal.rationale,
             )
