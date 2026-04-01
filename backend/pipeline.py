@@ -37,7 +37,13 @@ def describe_pipeline() -> Dict[str, Any]:
         "notes": [
             "Signal prices come from Alpha Vantage; execution prices are Tastytrade fills.",
             "Sandbox is for safe order-path testing; production uses TASTYTRADE_ENV=production.",
+            "Timing, pullback gate, buying-power reserve, and order type are exposed read-only at GET /config/execution (same rules as config.json + computed morning band).",
         ],
+        "related_http": {
+            "execution_profile": "GET /config/execution",
+            "pipeline_status": "GET /pipeline/status",
+            "root_discovery": "GET /",
+        },
     }
 
 

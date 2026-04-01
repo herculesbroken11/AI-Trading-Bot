@@ -52,7 +52,16 @@ bot_manager = TradingBotManager(data_feed, ai_engine, trade_executor, strategy)
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"message": "AI ETF Trading Bot API"})
+    return jsonify(
+        {
+            "message": "AI ETF Trading Bot API",
+            "endpoints": {
+                "execution_profile": "/config/execution",
+                "pipeline_describe": "/pipeline/describe",
+                "pipeline_status": "/pipeline/status",
+            },
+        }
+    )
 
 
 @app.route("/pipeline/describe", methods=["GET"])
