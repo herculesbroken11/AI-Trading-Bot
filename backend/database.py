@@ -60,6 +60,24 @@ class TrendSignal(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
+
+class OAuthToken(Base):
+    """
+    Persist tastytrade OAuth tokens so the bot remains authenticated
+    across restarts.
+    """
+    __tablename__ = "oauth_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String, index=True)  # e.g. "tastytrade"
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    token_type = Column(String, nullable=True)
+    scope = Column(String, nullable=True)
+    expires_in = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

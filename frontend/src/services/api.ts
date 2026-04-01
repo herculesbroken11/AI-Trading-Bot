@@ -89,6 +89,51 @@ export interface BotStatus {
   last_run: string | null;
 }
 
+/** Read-only slice of backend config + computed morning band (GET /config/execution). */
+export interface ExecutionProfile {
+  timezone: string;
+  market_open_time: string;
+  morning_wait_minutes_after_open: number | null;
+  entry_window_end: string;
+  entry_band_start: string;
+  entry_band_end: string;
+  entry_band_description: string;
+  order_type: string;
+  pullback_entry_enabled: boolean;
+  pullback_min_retrace_pct: number;
+  pullback_lookback_bars: number;
+  buying_power_reserve_pct: number;
+  max_position_pct_of_buying_power: number;
+  default_quantity: number;
+  forced_exit_time: string;
+  min_confidence: number;
+}
+
+export interface EntrySignalIndicators {
+  volume_surge?: boolean;
+  money_flow?: number;
+  volatility_burst?: boolean;
+  ai_direction?: string;
+  ai_confidence?: number;
+  pullback_met?: boolean;
+  pullback_retrace_or_bounce_pct?: number;
+  session_high?: number;
+  session_low?: number;
+  entry_window?: string;
+}
+
+export interface EntrySignal {
+  symbol: string;
+  side: string;
+  entry_price: number;
+  entry_window_start: string;
+  entry_window_end: string;
+  confidence: number;
+  rationale: string;
+  indicators?: EntrySignalIndicators;
+  order_type?: string;
+}
+
 export const tradingAPI = {
   getAuthUrl: async () => {
     const response = await api.get('/auth/tastytrade/url');
@@ -118,12 +163,12 @@ export const tradingAPI = {
     return response.data;
   },
 
-  fetchEntrySignal: async (symbol: string, ai_analysis: AIAnalysis) => {
+  fetchEntrySignal: async (symbol: string, ai_analysis: AIAnalysis): Promise<EntrySignal> => {
     const response = await api.post('/strategy/entry', {
       symbol,
       ai_analysis,
     });
-    return response.data;
+    return response.data as EntrySignal;
   },
 
   fetchExitSignal: async (payload: any) => {
@@ -165,6 +210,11 @@ export const tradingAPI = {
 
   getBotStatus: async (): Promise<BotStatus> => {
     const response = await api.get('/bot/status');
+    return response.data;
+  },
+
+  getExecutionProfile: async (): Promise<ExecutionProfile> => {
+    const response = await api.get('/config/execution');
     return response.data;
   },
 };

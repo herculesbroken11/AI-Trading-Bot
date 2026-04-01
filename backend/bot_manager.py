@@ -135,6 +135,7 @@ class TradingBotManager:
             default_quantity=self.config.get("default_quantity", 100),
             max_position_pct=self.config.get("max_position_pct_of_buying_power", 0.25),
             min_buying_power_required=self.config.get("min_buying_power_required", 5000),
+            reserve_pct=float(self.config.get("buying_power_reserve_pct", 0.0) or 0.0),
         )
         if quantity <= 0:
             logger.info("Skipping trade (position size): %s", size_reason)
@@ -149,10 +150,12 @@ class TradingBotManager:
             stop_loss = ai_response.stop_loss  # Use AI value if it's wider
 
         # Execute trade via Tastytrade
+        order_type = entry_signal.order_type or self.config.get("order_type", "Market")
         order = self.trade_executor.place_order(
             symbol=entry_signal.symbol,
             side=entry_signal.side,
-            quantity=quantity
+            quantity=quantity,
+            order_type=order_type,
         )
 
         trade = TradeLogger.log_trade(
@@ -254,10 +257,9 @@ class TradingBotManager:
             TradeLogger.update_trailing_stop(session, trade.trade_id, exit_decision.trailing_stop)
 
     def _is_entry_window(self) -> bool:
-        entry_start = self._parse_time(self.config.get("entry_window_start", "09:30"))
-        entry_end = self._parse_time(self.config.get("entry_window_end", "10:00"))
+        start_time, end_time, _, _ = self.strategy.get_effective_entry_window_times()
         now_et = datetime.now(self.strategy.timezone).time()
-        return entry_start <= now_et <= entry_end
+        return start_time <= now_et <= end_time
 
     def build_trend_context(self, symbols):
         """Enhanced trend context with 6-month analysis and seasonal patterns"""

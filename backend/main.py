@@ -32,10 +32,11 @@ from .logger import TradeLogger
 from .config import load_config
 from .bot_manager import TradingBotManager
 from .capital_manager import calculate_position_size, should_allow_trade
+from .pipeline import describe_pipeline, pipeline_status as build_pipeline_status
 
 config = load_config()
 auth = TastytradeAuth()
-data_feed = AlphaVantageDataFeed()
+data_feed = AlphaVantageDataFeed(config)
 strategy = TradingStrategy(config)
 trade_executor = TradeExecutor(auth)
 ai_engine: Optional[AIDecisionEngine] = None
@@ -52,6 +53,60 @@ bot_manager = TradingBotManager(data_feed, ai_engine, trade_executor, strategy)
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"message": "AI ETF Trading Bot API"})
+
+
+@app.route("/pipeline/describe", methods=["GET"])
+def pipeline_describe():
+    """How Alpha Vantage (data) and Tastytrade (execution) connect in this project."""
+    return jsonify(describe_pipeline())
+
+
+@app.route("/pipeline/status", methods=["GET"])
+def pipeline_status_route():
+    """Readiness: env vars + optional Tastytrade account probe."""
+    return jsonify(
+        build_pipeline_status(data_feed=data_feed, auth=auth, trade_executor=trade_executor)
+    )
+
+
+@app.route("/config/execution", methods=["GET"])
+def execution_config():
+    """Read-only execution / sizing parameters (config + computed morning entry band in ET)."""
+    cfg = load_config()
+    _, _, start_s, end_s = strategy.get_effective_entry_window_times()
+    wait = cfg.get("morning_wait_minutes_after_open")
+    open_s = cfg.get("market_open_time", "09:30")
+    if wait is not None:
+        desc = (
+            f"{start_s}–{end_s} ET — entries after US open ({open_s}) + {wait} min wait, "
+            f"through {end_s}."
+        )
+    else:
+        desc = f"{start_s}–{end_s} ET — from entry_window_start / entry_window_end."
+
+    return jsonify(
+        {
+            "timezone": cfg.get("timezone", "US/Eastern"),
+            "market_open_time": open_s,
+            "morning_wait_minutes_after_open": wait,
+            "entry_window_end": cfg.get("entry_window_end", "10:15"),
+            "entry_band_start": start_s,
+            "entry_band_end": end_s,
+            "entry_band_description": desc,
+            "order_type": cfg.get("order_type", "Market"),
+            "pullback_entry_enabled": bool(cfg.get("pullback_entry_enabled", True)),
+            "pullback_min_retrace_pct": float(cfg.get("pullback_min_retrace_pct", 0.0015)),
+            "pullback_lookback_bars": int(cfg.get("pullback_lookback_bars", 5)),
+            "buying_power_reserve_pct": float(cfg.get("buying_power_reserve_pct", 0.0)),
+            "max_position_pct_of_buying_power": float(
+                cfg.get("max_position_pct_of_buying_power", 0.25)
+            ),
+            "default_quantity": int(cfg.get("default_quantity", 100)),
+            "forced_exit_time": cfg.get("forced_exit_time", "15:30"),
+            "min_confidence": float(cfg.get("min_confidence", 65)),
+        }
+    )
+
 
 @app.route("/auth/tastytrade/url", methods=["GET"])
 def get_auth_url():
@@ -179,18 +234,22 @@ def execute_trade():
             default_quantity=requested_qty,
             max_position_pct=config.get("max_position_pct_of_buying_power", 0.25),
             min_buying_power_required=config.get("min_buying_power_required", 5000),
+            reserve_pct=float(config.get("buying_power_reserve_pct", 0.0) or 0.0),
         )
         if quantity <= 0:
             return jsonify({"detail": f"Cannot trade: {size_reason}"}), 400
         quantity = min(quantity, requested_qty)
         stop_loss = max(config.get("stop_loss_pct", 0.05), analysis.stop_loss or 0.05)
 
+        order_type = entry_signal.order_type or config.get("order_type", "Market")
         order = trade_executor.place_order(
             symbol=entry_signal.symbol,
             side=entry_signal.side,
-            quantity=quantity
+            quantity=quantity,
+            order_type=order_type,
         )
 
+        db = next(get_db())
         try:
             trade = TradeLogger.log_trade(
                 session=db,

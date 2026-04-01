@@ -15,6 +15,7 @@ def calculate_position_size(
     default_quantity: int,
     max_position_pct: float = 0.25,
     min_buying_power_required: float = 5000.0,
+    reserve_pct: float = 0.0,
 ) -> Tuple[int, str]:
     """
     Calculate safe position size based on available buying power.
@@ -27,9 +28,12 @@ def calculate_position_size(
     
     if entry_price <= 0:
         return (0, "invalid_entry_price")
+
+    reserve_pct = max(0.0, min(float(reserve_pct or 0.0), 0.95))
+    effective_bp = buying_power * (1.0 - reserve_pct)
     
     # Max capital to allocate to this single trade
-    max_trade_capital = buying_power * max_position_pct
+    max_trade_capital = effective_bp * max_position_pct
     
     # Max shares we can afford with that capital
     max_shares_by_capital = int(max_trade_capital / entry_price)
@@ -40,7 +44,8 @@ def calculate_position_size(
     if quantity <= 0:
         return (0, f"position_too_small: max_trade_capital ${max_trade_capital:.0f} / price ${entry_price:.2f} = 0 shares")
     
-    reason = "ok" if quantity == default_quantity else f"reduced_for_capital: using {quantity} shares (max allowed by {max_position_pct*100:.0f}% of buying power)"
+    suffix = f" (after {reserve_pct*100:.0f}% reserve)" if reserve_pct > 0 else ""
+    reason = "ok" if quantity == default_quantity else f"reduced_for_capital: using {quantity} shares (max allowed by {max_position_pct*100:.0f}% of effective buying power{suffix})"
     
     return (quantity, reason)
 

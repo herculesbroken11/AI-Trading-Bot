@@ -3,7 +3,8 @@ import { Card } from '../components/Card';
 import { Button } from '../components/Button';
 import { Modal } from '../components/Modal';
 import { Alert } from '../components/Alert';
-import { tradingAPI, AIAnalysis, BotStatus } from '../services/api';
+import { tradingAPI, AIAnalysis, BotStatus, EntrySignal, ExecutionProfile } from '../services/api';
+import { ExecutionProfileCard } from '../components/ExecutionProfileCard';
 import {
   Play,
   Square,
@@ -21,13 +22,32 @@ export const Controls: React.FC = () => {
   const [quantity, setQuantity] = useState(100);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [analysis, setAnalysis] = useState<AIAnalysis | null>(null);
-  const [entryPreview, setEntryPreview] = useState<any | null>(null);
+  const [entryPreview, setEntryPreview] = useState<EntrySignal | null>(null);
   const [loadingAnalysis, setLoadingAnalysis] = useState(false);
+  const [executionProfile, setExecutionProfile] = useState<ExecutionProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(true);
 
   useEffect(() => {
     refreshStatus();
     const interval = setInterval(refreshStatus, 10000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await tradingAPI.getExecutionProfile();
+        if (!cancelled) setExecutionProfile(p);
+      } catch {
+        if (!cancelled) setExecutionProfile(null);
+      } finally {
+        if (!cancelled) setProfileLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const refreshStatus = async () => {
@@ -109,6 +129,8 @@ export const Controls: React.FC = () => {
     <div className="space-y-6">
       <h1 className="text-3xl font-bold">Controls</h1>
 
+      <ExecutionProfileCard profile={executionProfile} loading={profileLoading} />
+
       {message && (
         <Alert variant={message.type === 'success' ? 'success' : 'error'} onClose={() => setMessage(null)}>
           {message.text}
@@ -147,6 +169,9 @@ export const Controls: React.FC = () => {
                 Bear (TZA)
               </Button>
             </div>
+            <p className="text-xs text-muted-foreground">
+              The strategy runs only while the bot is <strong>started</strong>; use Preview after Start so entry rules (window + pullback) can evaluate.
+            </p>
             <Button onClick={handlePreviewEntry} disabled={loadingAnalysis} className="w-full">
               {loadingAnalysis ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Radar className="h-4 w-4 mr-2" />}
               Preview Entry
@@ -180,6 +205,14 @@ export const Controls: React.FC = () => {
                   <strong>{entryPreview.symbol}</strong>
                 </div>
                 <div className="flex justify-between">
+                  <span>Side</span>
+                  <strong>{entryPreview.side}</strong>
+                </div>
+                <div className="flex justify-between">
+                  <span>Order type</span>
+                  <strong>{entryPreview.order_type ?? executionProfile?.order_type ?? 'Market'}</strong>
+                </div>
+                <div className="flex justify-between">
                   <span>Entry Price</span>
                   <strong>${entryPreview.entry_price.toFixed(2)}</strong>
                 </div>
@@ -190,6 +223,31 @@ export const Controls: React.FC = () => {
                     {new Date(entryPreview.entry_window_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </strong>
                 </div>
+                {entryPreview.indicators?.entry_window && (
+                  <div className="flex justify-between">
+                    <span>Band (ET)</span>
+                    <strong>{entryPreview.indicators.entry_window}</strong>
+                  </div>
+                )}
+                {entryPreview.indicators &&
+                  typeof entryPreview.indicators.pullback_retrace_or_bounce_pct === 'number' && (
+                    <div className="flex justify-between">
+                      <span>Pullback (retrace / bounce)</span>
+                      <strong>
+                        {(entryPreview.indicators.pullback_retrace_or_bounce_pct * 100).toFixed(3)}%
+                      </strong>
+                    </div>
+                  )}
+                {entryPreview.indicators &&
+                  typeof entryPreview.indicators.session_high === 'number' &&
+                  typeof entryPreview.indicators.session_low === 'number' && (
+                    <div className="flex justify-between gap-2">
+                      <span>Session high / low</span>
+                      <strong>
+                        ${entryPreview.indicators.session_high.toFixed(2)} / ${entryPreview.indicators.session_low.toFixed(2)}
+                      </strong>
+                    </div>
+                  )}
                 <div className="flex justify-between">
                   <span>Confidence</span>
                   <strong>{entryPreview.confidence.toFixed(1)}%</strong>

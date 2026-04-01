@@ -39,35 +39,57 @@ class TradingStrategy:
             return None
 
         now_et = datetime.now(self.timezone)
-        entry_start = self.config.get("entry_window_start", "09:30")
-        entry_end = self.config.get("entry_window_end", "10:00")
-        start_time = datetime.strptime(entry_start, "%H:%M").time()
-        end_time = datetime.strptime(entry_end, "%H:%M").time()
+        start_time, end_time, entry_start, entry_end = self.get_effective_entry_window_times()
 
         if not self._is_within_time_window(now_et.time(), start_time, end_time):
-            # Entry evaluation is only valid during the entry window
             return None
 
         entry_window_df = df.between_time(entry_start, entry_end)
         if entry_window_df.empty:
             return None
 
-        # Locate swing low (for long) or swing high (for short) within the window
-        if side == "buy":
-            candidate_row = entry_window_df.nsmallest(1, "low").iloc[0]
-            base_price = candidate_row["low"]
-        else:
-            candidate_row = entry_window_df.nlargest(1, "high").iloc[0]
-            base_price = candidate_row["high"]
+        pullback_enabled = bool(self.config.get("pullback_entry_enabled", True))
+        min_retrace = float(self.config.get("pullback_min_retrace_pct", 0.0015))
+        min_bars = max(2, int(self.config.get("pullback_lookback_bars", 5)))
 
+        last_row = entry_window_df.iloc[-1]
+        last_close = float(last_row["close"])
+
+        # Pullback / small counter-swing: long waits for dip from session high; short (bearish ETF) waits for bounce off session low
+        pullback_met = True
+        session_high = float(entry_window_df["high"].max())
+        session_low = float(entry_window_df["low"].min())
+        retrace_or_bounce_pct = 0.0
+
+        if pullback_enabled:
+            if len(entry_window_df) < min_bars:
+                return None
+            if side == "buy":
+                if session_high <= 0:
+                    return None
+                retrace_or_bounce_pct = (session_high - last_close) / session_high
+                pullback_met = retrace_or_bounce_pct >= min_retrace
+            else:
+                if session_low <= 0:
+                    return None
+                retrace_or_bounce_pct = (last_close - session_low) / session_low
+                pullback_met = retrace_or_bounce_pct >= min_retrace
+
+        if not pullback_met:
+            return None
+
+        # Market-style execution: size and log using last print; buffer kept for optional limit semantics elsewhere
         buffer_pct = self.config.get("entry_price_buffer", 0.001)
-        entry_price = base_price * (1 + buffer_pct if side == "buy" else 1 - buffer_pct)
+        entry_price = last_close * (1 + buffer_pct if side == "buy" else 1 - buffer_pct)
 
-        volume_surge = candidate_row["volume"] > (candidate_row.get("volume_sma_10") or entry_window_df["volume"].mean()) * 1.15
-        money_flow_strength = candidate_row.get("money_flow_volume", 0)
-        volatility_burst = abs(candidate_row.get("volatility_10", 0)) > entry_window_df["volatility_10"].mean()
+        vol_mean = entry_window_df["volume"].mean() or 1.0
+        volume_surge = last_row["volume"] > (last_row.get("volume_sma_10") or vol_mean) * 1.15
+        money_flow_strength = last_row.get("money_flow_volume", 0)
+        volatility_burst = abs(last_row.get("volatility_10", 0)) > entry_window_df["volatility_10"].mean()
 
-        rationale = ai_analysis.notes or "AI-directed entry based on intraday swing analysis"
+        rationale = ai_analysis.notes or "AI-directed entry: morning window + pullback from session extreme"
+
+        order_type = str(self.config.get("order_type", "Market"))
 
         return EntryStrategyResponse(
             symbol=symbol,
@@ -83,7 +105,13 @@ class TradingStrategy:
                 "volatility_burst": bool(volatility_burst),
                 "ai_direction": ai_analysis.direction,
                 "ai_confidence": ai_analysis.confidence,
+                "pullback_met": pullback_met,
+                "pullback_retrace_or_bounce_pct": float(retrace_or_bounce_pct),
+                "session_high": session_high,
+                "session_low": session_low,
+                "entry_window": f"{entry_start}-{entry_end}",
             },
+            order_type=order_type,
         )
 
     # ------------------------------------------------------------------
@@ -223,6 +251,29 @@ class TradingStrategy:
     def stop(self):
         self.is_active = False
 
+    def get_effective_entry_window_times(self) -> Tuple[time, time, str, str]:
+        """
+        Morning band: market_open + morning_wait_minutes_after_open .. entry_window_end (ET).
+        If morning_wait_minutes_after_open is omitted, uses entry_window_start / entry_window_end strings.
+        """
+        cfg = self.config
+        end_s = cfg.get("entry_window_end", "10:15")
+        end_time = self._parse_time(end_s)
+        wait = cfg.get("morning_wait_minutes_after_open")
+        if wait is not None:
+            open_s = cfg.get("market_open_time", "09:30")
+            open_time = self._parse_time(open_s)
+            today = datetime.now(self.timezone).date()
+            open_dt = self.timezone.localize(datetime.combine(today, open_time))
+            start_dt = open_dt + timedelta(minutes=int(wait))
+            start_time = start_dt.time()
+        else:
+            start_s = cfg.get("entry_window_start", "09:42")
+            start_time = self._parse_time(start_s)
+        start_str = start_time.strftime("%H:%M")
+        end_str = end_time.strftime("%H:%M")
+        return start_time, end_time, start_str, end_str
+
     def _is_within_time_window(self, current: time, start: time, end: time) -> bool:
         return start <= current <= end
 
@@ -250,14 +301,11 @@ class TradingStrategy:
         momentum_change = recent["close"].pct_change().tail(5).mean()
         money_flow = recent["money_flow_volume"].tail(10).sum()
         
-        # Enhanced hourly analysis
-        # Create temporary instance for hourly analysis (or better: pass data_feed instance)
         try:
             from .data_feed import AlphaVantageDataFeed
-            temp_feed = AlphaVantageDataFeed()
-            hourly_analysis = temp_feed.analyze_hourly_trends(df)
+
+            hourly_analysis = AlphaVantageDataFeed.analyze_hourly_trends(df)
         except Exception:
-            # Fallback if analysis fails
             hourly_analysis = {}
 
         return {

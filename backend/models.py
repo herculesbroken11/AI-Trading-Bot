@@ -47,6 +47,7 @@ class EntryStrategyResponse(BaseModel):
     confidence: float
     rationale: str
     indicators: Dict[str, Any]
+    order_type: str = "Market"
 
 class ExitStrategyRequest(BaseModel):
     trade_id: int

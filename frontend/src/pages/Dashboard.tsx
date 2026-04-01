@@ -8,7 +8,9 @@ import {
   MarketDataResponse,
   BotStatus,
   Trade,
+  ExecutionProfile,
 } from '../services/api';
+import { ExecutionProfileCard } from '../components/ExecutionProfileCard';
 import {
   TrendingUp,
   TrendingDown,
@@ -37,6 +39,8 @@ export const Dashboard: React.FC = () => {
   const [selectedSymbol, setSelectedSymbol] = useState<'TNA' | 'TZA'>('TNA');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [executionProfile, setExecutionProfile] = useState<ExecutionProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(true);
 
   useEffect(() => {
     loadData();
@@ -47,12 +51,13 @@ export const Dashboard: React.FC = () => {
   const loadData = async () => {
     setError(null);
     try {
-      const [balanceRes, logs, marketRes, analysisRes, statusRes] = await Promise.all([
+      const [balanceRes, logs, marketRes, analysisRes, statusRes, profileRes] = await Promise.all([
         tradingAPI.getBalance(),
         tradingAPI.getLogs(200),
         tradingAPI.fetchData(),
         tradingAPI.analyzeMarket(),
         tradingAPI.getBotStatus(),
+        tradingAPI.getExecutionProfile().catch(() => null),
       ]);
 
       setBalance(balanceRes);
@@ -73,11 +78,13 @@ export const Dashboard: React.FC = () => {
         return acc;
       }, []);
       setProfitData(cumulative);
+      setExecutionProfile(profileRes);
     } catch (err: any) {
       console.error('Failed to load dashboard data', err);
       setError(err?.response?.data?.detail || 'Unable to load dashboard data.');
     } finally {
       setLoading(false);
+      setProfileLoading(false);
     }
   };
 
@@ -102,6 +109,8 @@ export const Dashboard: React.FC = () => {
           </div>
         )}
       </div>
+
+      <ExecutionProfileCard profile={executionProfile} loading={profileLoading} compact />
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <MetricCard
