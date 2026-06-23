@@ -32,8 +32,18 @@ class TradingStrategy:
         if ai_analysis.skip_trade or ai_analysis.confidence < self.config.get("min_confidence", 65):
             return None
 
-        symbol = ai_analysis.recommended_symbol or ("TNA" if ai_analysis.direction == "bullish" else "TZA")
-        side = "buy" if symbol == "TNA" else "sell"
+        direction = (ai_analysis.direction or "").strip().lower()
+        if direction == "bullish":
+            symbol = ai_analysis.recommended_symbol or "TNA"
+        elif direction == "bearish":
+            symbol = ai_analysis.recommended_symbol or "TZA"
+        else:
+            return None
+
+        if symbol not in ("TNA", "TZA"):
+            return None
+
+        side = "buy"
         df = data_map.get(symbol)
         if df is None or df.empty:
             return None
@@ -55,32 +65,25 @@ class TradingStrategy:
         last_row = entry_window_df.iloc[-1]
         last_close = float(last_row["close"])
 
-        # Pullback / small counter-swing: long waits for dip from session high; short (bearish ETF) waits for bounce off session low
+        # Pullback entry: buy on dip from session high (TNA and TZA are both long-only in Phase 2)
         pullback_met = True
         session_high = float(entry_window_df["high"].max())
-        session_low = float(entry_window_df["low"].min())
         retrace_or_bounce_pct = 0.0
 
         if pullback_enabled:
             if len(entry_window_df) < min_bars:
                 return None
-            if side == "buy":
-                if session_high <= 0:
-                    return None
-                retrace_or_bounce_pct = (session_high - last_close) / session_high
-                pullback_met = retrace_or_bounce_pct >= min_retrace
-            else:
-                if session_low <= 0:
-                    return None
-                retrace_or_bounce_pct = (last_close - session_low) / session_low
-                pullback_met = retrace_or_bounce_pct >= min_retrace
+            if session_high <= 0:
+                return None
+            retrace_or_bounce_pct = (session_high - last_close) / session_high
+            pullback_met = retrace_or_bounce_pct >= min_retrace
 
         if not pullback_met:
             return None
 
         # Market-style execution: size and log using last print; buffer kept for optional limit semantics elsewhere
         buffer_pct = self.config.get("entry_price_buffer", 0.001)
-        entry_price = last_close * (1 + buffer_pct if side == "buy" else 1 - buffer_pct)
+        entry_price = last_close * (1 + buffer_pct)
 
         vol_mean = entry_window_df["volume"].mean() or 1.0
         volume_surge = last_row["volume"] > (last_row.get("volume_sma_10") or vol_mean) * 1.15
@@ -108,7 +111,6 @@ class TradingStrategy:
                 "pullback_met": pullback_met,
                 "pullback_retrace_or_bounce_pct": float(retrace_or_bounce_pct),
                 "session_high": session_high,
-                "session_low": session_low,
                 "entry_window": f"{entry_start}-{entry_end}",
             },
             order_type=order_type,
