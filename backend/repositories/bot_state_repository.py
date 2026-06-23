@@ -7,6 +7,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from backend.config.settings import Settings
 from backend.db.models import BotStateRecord
 
 
@@ -35,8 +36,31 @@ class BotStateRepository:
             self._session.refresh(record)
         return record
 
+    def ensure_initialized(self, settings: Settings) -> BotStateRecord:
+        """Ensure singleton bot_state row exists with safe stopped defaults."""
+        record = self._get_or_create()
+        record.running = False
+        record.emergency_halt = settings.emergency_halt
+        record.trading_mode = settings.trading_mode
+        record.active_trade_id = None
+        record.status_message = "initialized"
+        record.last_heartbeat_at = datetime.utcnow()
+        record.updated_at = datetime.utcnow()
+        self._session.commit()
+        self._session.refresh(record)
+        return record
+
     def get_state(self) -> BotStateRecord:
         return self._get_or_create()
+
+    def heartbeat(self, status_message: str = "heartbeat") -> BotStateRecord:
+        record = self._get_or_create()
+        record.last_heartbeat_at = datetime.utcnow()
+        record.status_message = status_message
+        record.updated_at = datetime.utcnow()
+        self._session.commit()
+        self._session.refresh(record)
+        return record
 
     def set_running(self, *, trading_mode: str, status_message: str = "running") -> BotStateRecord:
         record = self._get_or_create()

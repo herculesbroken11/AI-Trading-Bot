@@ -50,6 +50,9 @@ def create_app(
     if not skip_db_init:
         try:
             init_db()
+            from backend.bootstrap import initialize_bot_state_on_startup
+
+            initialize_bot_state_on_startup(settings)
         except Exception as exc:
             logger.error("Database initialization failed: %s", type(exc).__name__)
 
