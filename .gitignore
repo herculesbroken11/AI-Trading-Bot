@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+backend/venv/
 venv/
 env/
 ENV/
@@ -11,10 +12,20 @@ ENV/
 *.db
 *.sqlite
 *.sqlite3
+.pytest_cache/
 
 # Environment variables
 .env
-.env.local
+.env.*
+!.env.example
+
+# Secrets & credentials
+*.pem
+credentials.json
+secrets.json
+*.key
+*.p12
+*.pfx
 
 # Node
 node_modules/
@@ -27,6 +38,7 @@ yarn-error.log*
 # Build outputs
 dist/
 build/
+.next/
 *.egg-info/
 
 # IDE
@@ -44,3 +56,5 @@ Thumbs.db
 *.log
 logs/
 
+# Documentation (local only — not pushed to remote)
+docs/

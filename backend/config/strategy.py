@@ -1,7 +1,7 @@
 import json
 import os
-from typing import Any, Dict
 from functools import lru_cache
+from typing import Any, Dict
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "timezone": "US/Eastern",
@@ -34,6 +34,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 CONFIG_ENV_KEY = "TRADING_BOT_CONFIG"
 CONFIG_FILENAME = "config.json"
+
 
 @lru_cache()
 def load_config() -> Dict[str, Any]:

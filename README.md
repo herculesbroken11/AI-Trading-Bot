@@ -37,10 +37,22 @@ ai_trading_bot/
 │   ├── package.json
 │   └── tailwind.config.js
 ├── .env.example
-├── SETUP.md
 ├── config.json             # Default strategy configuration
+├── docs/                   # All documentation (audit, setup, requirements)
+│   ├── phase-1/            # Phase 1 audit (start here)
+│   ├── phase-2/            # Phase 2 implementation plan
+│   ├── setup/              # SETUP.md, PostgreSQL
+│   └── project/            # Client requirements, enhancements
 └── README.md
 ```
+
+## Documentation
+
+Full documentation is in **[docs/README.md](docs/README.md)**.
+
+- **Phase 1 audit:** [docs/phase-1/PHASE_1_AUDIT_REPORT.md](docs/phase-1/PHASE_1_AUDIT_REPORT.md)
+- **Setup:** [docs/setup/SETUP.md](docs/setup/SETUP.md)
+- **Phase 2 plan (after approval):** [docs/phase-2/PHASE_2_IMPLEMENTATION_PLAN.md](docs/phase-2/PHASE_2_IMPLEMENTATION_PLAN.md)
 
 ## 🛠️ Quick Start
 
@@ -122,10 +134,15 @@ Create `.env` at the repository root:
 TASTYTRADE_CLIENT_ID=your_client_id
 TASTYTRADE_CLIENT_SECRET=your_client_secret
 TASTYTRADE_REDIRECT_URI=https://localhost
-ALPHAVANTAGE_API_KEY=BAK0PFQWV70EANSC
-OPENAI_API_KEY=sk-your-openai-key
-DATABASE_URL=postgresql://user:password@localhost:5432/tradebot
+ALPHAVANTAGE_API_KEY=your_alpha_vantage_key
+OPENAI_API_KEY=your_openai_key
+DATABASE_URL=postgresql://tradebot:tradebot@localhost:5432/tradebot
+LIVE_TRADING_ENABLED=false
+TRADING_MODE=paper
+EMERGENCY_HALT=false
 TASTYTRADE_ENV=sandbox
+API_ADMIN_KEY=change-me-long-random-string
+MAX_DAILY_LOSS_USD=500
 TRADING_BOT_CONFIG=config.json
 ```
 
