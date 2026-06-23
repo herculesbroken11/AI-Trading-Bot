@@ -108,18 +108,23 @@ class TradingBotManager:
         if not entry_signal:
             return
 
-        # Capital management: follow available funds first, avoid overtrading
+        buying_power: Optional[float] = None
         try:
             account_info = self.trade_executor.get_account_info()
-            buying_power = float(account_info.get("buying_power") or account_info.get("balance") or 0)
+            raw_bp = account_info.get("buying_power") or account_info.get("balance")
+            if raw_bp is not None:
+                buying_power = float(raw_bp)
         except Exception as e:
-            logger.warning("Could not get account info for capital check: %s. Using default quantity.", e)
-            buying_power = 0  # Will use default if we can't check
+            logger.warning("Could not get account info for capital check: %s", e)
+
+        if buying_power is None or buying_power <= 0:
+            logger.info("Skipping trade: account buying power unavailable")
+            return
 
         max_trades = self.config.get("max_trades_per_day", 1)
         trades_today = TradeLogger.count_trades_closed_today(session)
         allow, allow_reason = should_allow_trade(
-            buying_power=buying_power if buying_power > 0 else 999999,  # Allow if we couldn't fetch
+            buying_power=buying_power,
             min_buying_power_required=self.config.get("min_buying_power_required", 5000),
             has_open_position=bool(self.active_trade_id),
             trades_today=trades_today,
@@ -130,7 +135,7 @@ class TradingBotManager:
             return
 
         quantity, size_reason = calculate_position_size(
-            buying_power=buying_power if buying_power > 0 else 100000,  # Fallback for paper mode
+            buying_power=buying_power,
             entry_price=entry_signal.entry_price,
             default_quantity=self.config.get("default_quantity", 100),
             max_position_pct=self.config.get("max_position_pct_of_buying_power", 0.25),

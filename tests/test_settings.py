@@ -93,3 +93,11 @@ def test_sandbox_mode_allowed(monkeypatch):
     monkeypatch.setenv("TRADING_MODE", "sandbox")
     settings = load_settings(env_path=_NO_ENV)
     assert settings.trading_mode == "sandbox"
+
+
+def test_validate_startup_rejects_non_sandbox_env(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("TASTYTRADE_ENV", "production")
+    settings = load_settings(env_path=_NO_ENV)
+    with pytest.raises(ConfigurationError, match="sandbox"):
+        settings.validate_startup()

@@ -95,6 +95,16 @@ class Settings:
                 "Live order routing is not implemented or permitted."
             )
 
+    def validate_startup(self) -> None:
+        """Full startup validation including broker environment."""
+        self.validate()
+        env = self.tastytrade_env.strip().lower()
+        if env != "sandbox":
+            raise ConfigurationError(
+                f"TASTYTRADE_ENV={self.tastytrade_env!r} is not permitted in Phase 2. "
+                "Only sandbox is allowed."
+            )
+
     def safe_summary(self) -> Dict[str, Any]:
         """Return non-secret mode and configuration flags for logging."""
         return {

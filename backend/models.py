@@ -95,10 +95,12 @@ class TradeResponse(BaseModel):
         from_attributes = True
 
 class AccountBalance(BaseModel):
-    balance: float
-    buying_power: float
-    open_positions: int
-    daily_pnl: float
+    balance: Optional[float] = None
+    buying_power: Optional[float] = None
+    open_positions: int = 0
+    daily_pnl: float = 0.0
+    status: str = "ok"
+    message: Optional[str] = None
 
 class BotStatus(BaseModel):
     running: bool
