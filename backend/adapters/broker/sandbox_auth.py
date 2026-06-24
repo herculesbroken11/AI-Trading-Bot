@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 from typing import Any, Dict, Optional
 
 import httpx
 
+from backend.adapters.broker.oauth_diagnostics import (
+    OAUTH_TOKEN_PATH,
+    REFRESH_GRANT_TYPE,
+    OAuthFailureDiagnostics,
+    build_oauth_diagnostics,
+    oauth_next_step_hint,
+    redact_oauth_body,
+)
 from backend.config.settings import Settings
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, USER_AGENT, assert_sandbox_base_url
 
@@ -18,6 +25,15 @@ REQUEST_TIMEOUT = 30.0
 
 class SandboxAuthError(RuntimeError):
     """Sandbox authentication failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: Optional[OAuthFailureDiagnostics] = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 class SandboxOAuthClient:
@@ -30,6 +46,8 @@ class SandboxOAuthClient:
         self._settings = settings
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = settings.tastytrade_refresh_token.strip() or None
+        self._oauth_attempted = False
+        self._oauth_failed = False
 
     @property
     def base_url(self) -> str:
@@ -39,11 +57,32 @@ class SandboxOAuthClient:
     def is_authenticated(self) -> bool:
         return bool(self._access_token)
 
+    @property
+    def oauth_attempted(self) -> bool:
+        return self._oauth_attempted
+
+    def credential_flags(self) -> Dict[str, bool]:
+        return {
+            "client_id_configured": bool(self._settings.tastytrade_client_id.strip()),
+            "client_secret_configured": bool(self._settings.tastytrade_client_secret.strip()),
+            "refresh_token_configured": bool(self._refresh_token),
+            "redirect_uri_configured": bool(self._settings.tastytrade_redirect_uri.strip()),
+        }
+
     def ensure_authenticated(self) -> None:
         if self._access_token:
             return
-        refresh = self._refresh_token
-        if not refresh:
+        if self._oauth_failed:
+            raise SandboxAuthError(
+                "Sandbox OAuth already failed in this session. "
+                "Fix credentials and restart — OAuth is not retried automatically."
+            )
+        if self._oauth_attempted:
+            raise SandboxAuthError(
+                "Sandbox OAuth already attempted without success. "
+                "Fix credentials and restart."
+            )
+        if not self._refresh_token:
             raise SandboxAuthError(
                 "Not authenticated. Set TASTYTRADE_REFRESH_TOKEN and client credentials in .env."
             )
@@ -52,7 +91,7 @@ class SandboxOAuthClient:
     def get_headers(self) -> Dict[str, str]:
         self.ensure_authenticated()
         return {
-            "Authorization": "Bearer [REDACTED]",  # never log real token — use _auth_header internally
+            "Authorization": "Bearer [REDACTED]",
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
         }
@@ -66,42 +105,101 @@ class SandboxOAuthClient:
         return {
             "Authorization": self._auth_header_value(),
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "User-Agent": USER_AGENT,
         }
 
     def refresh_access_token(self) -> None:
+        """Refresh after API 401 (one retry allowed if prior auth succeeded)."""
+        if self._oauth_failed:
+            raise SandboxAuthError("OAuth refresh blocked after prior failure in this session.")
+        self._access_token = None
         self._refresh_access_token()
 
+    def _build_refresh_payload(self) -> Dict[str, str]:
+        """
+        Tastytrade refresh_token grant (matches official SDK).
+
+        POST /oauth/token with JSON body: grant_type, client_secret, refresh_token.
+        scope included when configured (required by JS SDK).
+        redirect_uri is not sent for refresh_token grant.
+        """
+        client_secret = self._settings.tastytrade_client_secret.strip()
+        refresh = self._refresh_token or ""
+        payload: Dict[str, str] = {
+            "grant_type": REFRESH_GRANT_TYPE,
+            "client_secret": client_secret,
+            "refresh_token": refresh,
+        }
+        scope = self._settings.tastytrade_oauth_scopes.strip()
+        if scope:
+            payload["scope"] = scope
+        return payload
+
     def _refresh_access_token(self) -> None:
-        client_id = self._settings.tastytrade_client_id
-        client_secret = self._settings.tastytrade_client_secret
+        client_secret = self._settings.tastytrade_client_secret.strip()
         refresh = self._refresh_token
-        if not client_id or not client_secret or not refresh:
+        if not client_secret or not refresh:
             raise SandboxAuthError("Missing sandbox OAuth credentials in settings")
 
-        auth_string = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            response = client.post(
-                f"{SANDBOX_BASE_URL}/oauth/token",
-                headers={
-                    "Authorization": f"Basic {auth_string}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": USER_AGENT,
-                },
-                data={"grant_type": "refresh_token", "refresh_token": refresh},
+        self._oauth_attempted = True
+        payload = self._build_refresh_payload()
+        flags = self.credential_flags()
+
+        try:
+            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+                response = client.post(
+                    f"{SANDBOX_BASE_URL}{OAUTH_TOKEN_PATH}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": USER_AGENT,
+                    },
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            raise SandboxAuthError(
+                "Sandbox OAuth timed out. Possible network issue or IP block — retry later."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise SandboxAuthError(
+                f"Sandbox OAuth request failed: {type(exc).__name__}. Check network connectivity."
+            ) from exc
+
+        if response.status_code >= 400:
+            self._oauth_failed = True
+            diagnostics = build_oauth_diagnostics(
+                status_code=response.status_code,
+                response_text=response.text,
+                grant_type=REFRESH_GRANT_TYPE,
+                client_id_configured=flags["client_id_configured"],
+                client_secret_configured=flags["client_secret_configured"],
+                refresh_token_configured=flags["refresh_token_configured"],
+                redirect_uri_configured=flags["redirect_uri_configured"],
             )
-            if response.status_code in (401, 403):
-                raise SandboxAuthError(
-                    "Sandbox OAuth failed (401/403). Check credentials and User-Agent."
-                )
-            if response.status_code == 400:
-                raise SandboxAuthError(
-                    "Sandbox OAuth failed (400). Refresh token may be expired (sandbox "
-                    "resets every 24h) or client credentials may not match the sandbox app."
-                )
-            response.raise_for_status()
-            data = response.json()
-            self._access_token = data.get("access_token")
-            self._refresh_token = data.get("refresh_token", refresh)
-            if not self._access_token:
-                raise SandboxAuthError("Token response missing access_token")
+            logger.debug(
+                "Sandbox OAuth failed\n%s",
+                diagnostics.format_safe(),
+            )
+            hint = oauth_next_step_hint(diagnostics)
+            raise SandboxAuthError(
+                f"Sandbox OAuth failed ({response.status_code}).\n"
+                f"{diagnostics.format_safe()}\n{hint}",
+                diagnostics=diagnostics,
+            )
+
+        data = self._parse_token_response(response)
+        self._access_token = data.get("access_token")
+        self._refresh_token = data.get("refresh_token", refresh)
+        if not self._access_token:
+            raise SandboxAuthError("Token response missing access_token")
+
+    @staticmethod
+    def _parse_token_response(response: httpx.Response) -> Dict[str, Any]:
+        try:
+            return response.json()
+        except Exception as exc:
+            redacted = redact_oauth_body(response.text[:500])
+            raise SandboxAuthError(
+                f"Sandbox OAuth returned non-JSON response: {redacted}"
+            ) from exc

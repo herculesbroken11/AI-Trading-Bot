@@ -38,9 +38,19 @@ def test_adapter_base_url_is_sandbox_only():
     assert adapter.base_url == SANDBOX_BASE_URL
 
 
-def test_get_headers_never_logs_real_token():
+@patch("backend.adapters.broker.sandbox_auth.httpx.Client")
+def test_get_headers_never_logs_real_token(mock_client_cls):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"access_token": "super-secret-token"}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.post.return_value = mock_response
+    mock_client_cls.return_value = mock_client
+
     client = SandboxOAuthClient(_settings())
-    client._access_token = "super-secret-token"
+    client.ensure_authenticated()
     headers = client.get_headers()
     assert "super-secret-token" not in str(headers)
     assert headers["Authorization"] == "Bearer [REDACTED]"

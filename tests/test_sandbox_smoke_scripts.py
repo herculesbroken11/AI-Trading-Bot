@@ -84,3 +84,25 @@ def test_read_script_does_not_submit_orders():
     text = READ_SCRIPT.read_text(encoding="utf-8")
     assert "submit_equity_order" not in text
     assert "OrderExecutor" not in text
+    assert "/orders" not in text
+
+
+def test_read_script_runs_env_checker_first():
+    text = READ_SCRIPT.read_text(encoding="utf-8")
+    assert "sandbox_env_flags" in text or "format_sandbox_env_report" in text
+    assert "ensure_authenticated" in text
+    env_pos = text.find("sandbox_env")
+    auth_pos = text.find("ensure_authenticated")
+    accounts_pos = text.find("get_accounts")
+    assert env_pos < auth_pos < accounts_pos
+
+
+def test_read_script_rejects_unsafe_env_missing_secret(monkeypatch, capsys):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.delenv("TASTYTRADE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("TASTYTRADE_REFRESH_TOKEN", raising=False)
+    reset_settings_cache()
+    mod = _load_module(READ_SCRIPT, "smoke_read_env")
+    assert mod.main([]) != 0
