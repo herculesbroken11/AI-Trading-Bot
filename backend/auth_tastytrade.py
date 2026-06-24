@@ -5,6 +5,8 @@ import base64
 from datetime import datetime
 from urllib.parse import urlencode
 
+from backend.config.tastytrade_urls import resolve_broker_base_url
+
 from .database import SessionLocal, OAuthToken
 
 
@@ -14,7 +16,7 @@ class TastytradeAuth:
         self.client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
         self.redirect_uri = os.getenv("TASTYTRADE_REDIRECT_URI", "https://localhost")
         self.env = os.getenv("TASTYTRADE_ENV", "sandbox")
-        self.base_url = "https://api.cert.tastytrade.com" if self.env == "sandbox" else "https://api.tastytrade.com"
+        self.base_url = resolve_broker_base_url(self.env)
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self._load_tokens_from_db()

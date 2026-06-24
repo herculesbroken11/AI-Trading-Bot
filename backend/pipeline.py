@@ -13,6 +13,7 @@ import os
 from typing import Any, Dict, Optional
 
 from .config import load_config
+from backend.config.tastytrade_urls import SANDBOX_BASE_URL
 
 
 def describe_pipeline() -> Dict[str, Any]:
@@ -22,11 +23,7 @@ def describe_pipeline() -> Dict[str, Any]:
         "market_data_provider": "Alpha Vantage",
         "execution_provider": "Tastytrade",
         "tastytrade_environment": env,
-        "tastytrade_api_base": (
-            "https://api.cert.tastytrade.com"
-            if env == "sandbox"
-            else "https://api.tastytrade.com"
-        ),
+        "tastytrade_api_base": SANDBOX_BASE_URL if env == "sandbox" else "production-blocked-in-phase-2",
         "symbols": cfg.get("symbols", ["TNA", "TZA"]),
         "flow": [
             "1. Fetch OHLCV from Alpha Vantage (cached + rate-limited).",

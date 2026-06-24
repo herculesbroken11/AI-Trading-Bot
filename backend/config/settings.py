@@ -13,6 +13,8 @@ from typing import Any, Dict, FrozenSet, Optional
 
 from dotenv import load_dotenv
 
+from backend.config.tastytrade_urls import SANDBOX_BASE_URL
+
 # Phase 2: only paper (local sim) and sandbox (cert API) are permitted modes.
 ALLOWED_TRADING_MODES_PHASE_2: FrozenSet[str] = frozenset({"paper", "sandbox"})
 
@@ -112,6 +114,10 @@ class Settings:
             "trading_mode": self.trading_mode,
             "tastytrade_env": self.tastytrade_env,
             "emergency_halt": self.emergency_halt,
+            "sandbox_base_url": (
+                SANDBOX_BASE_URL if self.tastytrade_env.strip().lower() == "sandbox" else None
+            ),
+            "production_broker_blocked": True,
             "max_daily_loss_usd": self.max_daily_loss_usd,
             "sql_echo": self.sql_echo,
             "openai_model": self.openai_model,

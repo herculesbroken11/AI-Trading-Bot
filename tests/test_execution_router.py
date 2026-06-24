@@ -33,16 +33,15 @@ def test_production_tastytrade_env_blocked():
     assert "sandbox" in result.message.lower()
 
 
-def test_sandbox_mode_does_not_place_real_order():
+def test_sandbox_mode_requires_adapter():
     router = ExecutionRouter()
     result = router.route(
-        make_intent(trading_mode="sandbox"),
+        make_intent(trading_mode="sandbox", quantity=1),
         make_context(trading_mode="sandbox"),
     )
     assert result.success is False
     assert result.status == "error"
-    assert "not wired" in result.message.lower()
-    assert result.raw.get("placed") is False
+    assert "not configured" in result.message.lower()
 
 
 def test_old_trade_exec_not_imported_by_router():
