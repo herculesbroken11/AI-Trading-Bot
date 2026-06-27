@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError, SandboxOAuthClient
+from backend.adapters.broker.sandbox_step_diagnostics import (
+    StepFailureDiagnostics,
+    build_step_failure,
+)
 from backend.config.settings import Settings
 from backend.config.tastytrade_urls import (
     ALLOWED_SANDBOX_SYMBOLS,
@@ -29,8 +33,11 @@ class SandboxApiError(Exception):
     status_code: int
     message: str
     body: Optional[Dict[str, Any]] = None
+    step_diagnostics: Optional[StepFailureDiagnostics] = None
 
     def __str__(self) -> str:
+        if self.step_diagnostics:
+            return self.step_diagnostics.format_safe()
         return self.message
 
 
@@ -61,58 +68,82 @@ class TastytradeSandboxAdapter:
         method: str,
         path: str,
         *,
+        step: str,
         json: Optional[Dict[str, Any]] = None,
     ) -> httpx.Response:
         url = f"{SANDBOX_BASE_URL}{path}"
         assert_sandbox_base_url(SANDBOX_BASE_URL)
+        headers = self._auth.request_headers()
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            response = client.request(
-                method,
-                url,
-                headers=self._auth.request_headers(),
-                json=json,
-            )
-            if response.status_code in (401, 403):
+            response = client.request(method, url, headers=headers, json=json)
+            if response.status_code == 401:
                 self._auth.refresh_access_token()
-                response = client.request(
-                    method,
-                    url,
-                    headers=self._auth.request_headers(),
-                    json=json,
+                headers = self._auth.request_headers()
+                response = client.request(method, url, headers=headers, json=json)
+            if response.status_code >= 400:
+                raise self._parse_error(
+                    response,
+                    step=step,
+                    path=path,
+                    request_headers=headers,
                 )
             return response
 
-    def _parse_error(self, response: httpx.Response, *, symbol: Optional[str] = None) -> SandboxApiError:
-        try:
-            body = response.json()
-        except Exception:
-            body = None
+    def _parse_error(
+        self,
+        response: httpx.Response,
+        *,
+        step: str,
+        path: str,
+        request_headers: Dict[str, str],
+        symbol: Optional[str] = None,
+    ) -> SandboxApiError:
+        step_diag = build_step_failure(
+            step=step,
+            status_code=response.status_code,
+            endpoint_path=path,
+            request_headers=request_headers,
+            response_text=response.text,
+        )
         if response.status_code == 422:
             msg = (
-                f"Sandbox API returned 422 for {symbol or 'request'}. "
+                f"Sandbox API returned 422 for {symbol or step}. "
                 "Valid symbols may lag in sandbox instrumentation — retry later."
             )
         elif response.status_code == 429:
             msg = "Sandbox API rate limit (429). Retry after a short delay."
         elif response.status_code >= 500:
             msg = f"Sandbox API server error ({response.status_code})."
-        elif response.status_code in (401, 403):
+        elif response.status_code == 403:
+            msg = f"Sandbox API returned 403 for step {step}."
+        elif response.status_code == 401:
             msg = "Sandbox authentication failed. Check credentials and User-Agent header."
         else:
-            msg = f"Sandbox API error ({response.status_code})."
-        return SandboxApiError(response.status_code, msg, body)
+            msg = f"Sandbox API error ({response.status_code}) for step {step}."
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        return SandboxApiError(
+            response.status_code,
+            msg,
+            body,
+            step_diagnostics=step_diag,
+        )
+
+    def get_customers_me(self) -> Dict[str, Any]:
+        """Fetch authenticated sandbox customer profile (read smoke step)."""
+        self._auth.ensure_authenticated()
+        response = self._request("GET", "/customers/me", step="get_customers_me")
+        return response.json().get("data", {})
 
     def get_accounts(self) -> List[Dict[str, Any]]:
         self._auth.ensure_authenticated()
-        response = self._request("GET", "/customers/me/accounts")
-        if response.status_code >= 400:
-            raise self._parse_error(response)
+        response = self._request("GET", "/customers/me/accounts", step="get_accounts")
         data = response.json()
         items = data.get("data", {}).get("items", [])
         if not items:
-            accounts_resp = self._request("GET", "/accounts")
-            if accounts_resp.status_code >= 400:
-                raise self._parse_error(accounts_resp)
+            accounts_resp = self._request("GET", "/accounts", step="get_accounts")
             items = accounts_resp.json().get("data", {}).get("items", [])
         return items
 
@@ -123,7 +154,18 @@ class TastytradeSandboxAdapter:
             return self._selected_account
         accounts = self.get_accounts()
         if not accounts:
-            raise SandboxApiError(404, "No sandbox accounts found")
+            raise SandboxApiError(
+                404,
+                "No sandbox accounts found",
+                step_diagnostics=StepFailureDiagnostics(
+                    step="get_accounts",
+                    status_code=404,
+                    endpoint_path="/customers/me/accounts",
+                    authorization_present=True,
+                    user_agent_present=True,
+                    provider_message="No accounts returned",
+                ),
+            )
         acct = accounts[0]
         number = acct.get("account-number") or acct.get("account_number")
         if not number and isinstance(acct.get("account"), dict):
@@ -135,9 +177,8 @@ class TastytradeSandboxAdapter:
 
     def get_balance(self, account_number: Optional[str] = None) -> Dict[str, Any]:
         acct = self._resolve_account_number(account_number)
-        response = self._request("GET", f"/accounts/{acct}/balances")
-        if response.status_code >= 400:
-            raise self._parse_error(response)
+        path = f"/accounts/{acct}/balances"
+        response = self._request("GET", path, step="get_balance")
         payload = response.json().get("data", {})
         return {
             "account_number": acct,
@@ -148,9 +189,8 @@ class TastytradeSandboxAdapter:
 
     def get_positions(self, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
         acct = self._resolve_account_number(account_number)
-        response = self._request("GET", f"/accounts/{acct}/positions")
-        if response.status_code >= 400:
-            raise self._parse_error(response)
+        path = f"/accounts/{acct}/positions"
+        response = self._request("GET", path, step="get_positions")
         return response.json().get("data", {}).get("items", [])
 
     def submit_equity_order(
@@ -189,16 +229,14 @@ class TastytradeSandboxAdapter:
                 }
             ],
         }
-        response = self._request("POST", f"/accounts/{acct}/orders", json=order_data)
-        if response.status_code >= 400:
-            raise self._parse_error(response, symbol=symbol)
+        path = f"/accounts/{acct}/orders"
+        response = self._request("POST", path, step="submit_order", json=order_data)
         return response.json()
 
     def get_order(self, account_number: Optional[str], order_id: str) -> Dict[str, Any]:
         acct = self._resolve_account_number(account_number)
-        response = self._request("GET", f"/accounts/{acct}/orders/{order_id}")
-        if response.status_code >= 400:
-            raise self._parse_error(response)
+        path = f"/accounts/{acct}/orders/{order_id}"
+        response = self._request("GET", path, step="get_order")
         return response.json()
 
     def execute_order(self, intent: OrderIntent) -> ExecutionResult:
@@ -240,6 +278,11 @@ class TastytradeSandboxAdapter:
             )
         except SandboxApiError as exc:
             status = "rejected" if exc.status_code == 422 else "error"
+            message = (
+                exc.step_diagnostics.format_safe()
+                if exc.step_diagnostics
+                else str(exc)
+            )
             return ExecutionResult(
                 success=False,
                 status=status,
@@ -247,10 +290,15 @@ class TastytradeSandboxAdapter:
                 side=side,
                 quantity=intent.quantity,
                 trading_mode=mode,
-                message=str(exc),
+                message=message,
                 raw={"status_code": exc.status_code, "route": "sandbox", "placed": False},
             )
         except SandboxAuthError as exc:
+            message = (
+                exc.step_diagnostics.format_safe()
+                if exc.step_diagnostics
+                else str(exc)
+            )
             return ExecutionResult(
                 success=False,
                 status="error",
@@ -258,6 +306,6 @@ class TastytradeSandboxAdapter:
                 side=side,
                 quantity=intent.quantity,
                 trading_mode=mode,
-                message=str(exc),
+                message=message,
                 raw={"route": "sandbox", "placed": False},
             )

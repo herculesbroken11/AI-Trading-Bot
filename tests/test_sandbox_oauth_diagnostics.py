@@ -103,13 +103,13 @@ def test_oauth_failure_is_redacted(mock_client_cls, caplog):
         with pytest.raises(SandboxAuthError) as exc:
             client.ensure_authenticated()
 
-    msg = str(exc.value)
-    assert "leaked-refresh" not in msg
-    assert "secret-value" not in msg
-    assert "refresh-value" not in msg
+    assert exc.value.step_diagnostics is not None
+    assert exc.value.step_diagnostics.step == "oauth_token"
+    assert "leaked-refresh" not in str(exc.value.step_diagnostics.format_safe())
+    assert "secret-value" not in str(exc.value.step_diagnostics.format_safe())
+    assert "refresh-value" not in str(exc.value.step_diagnostics.format_safe())
     assert exc.value.diagnostics is not None
     assert exc.value.diagnostics.error_code == "invalid_grant"
-    assert "invalid_grant" in msg or exc.value.diagnostics.format_safe()
 
 
 @patch("backend.adapters.broker.sandbox_auth.httpx.Client")

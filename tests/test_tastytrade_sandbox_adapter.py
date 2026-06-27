@@ -87,7 +87,8 @@ def test_submit_order_422_message(mock_client_cls):
 
     order_response = MagicMock()
     order_response.status_code = 422
-    order_response.json.return_value = {"error": "instrumentation lag"}
+    order_response.text = '{"error":{"message":"instrumentation lag"}}'
+    order_response.json.return_value = {"error": {"message": "instrumentation lag"}}
 
     mock_client = MagicMock()
     mock_client.__enter__.return_value = mock_client
@@ -95,13 +96,52 @@ def test_submit_order_422_message(mock_client_cls):
     mock_client_cls.return_value = mock_client
 
     auth = MagicMock(spec=SandboxOAuthClient)
-    auth.request_headers.return_value = {"Authorization": "Bearer x"}
+    auth.request_headers.return_value = {
+        "Authorization": "Bearer x",
+        "User-Agent": "AI-Trading-Bot/0.1",
+    }
     adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
 
     with pytest.raises(SandboxApiError) as exc:
         adapter.submit_equity_order(None, "TNA", "buy", 1)
     assert exc.value.status_code == 422
-    assert "422" in str(exc.value)
+    assert exc.value.step_diagnostics is not None
+    assert exc.value.step_diagnostics.step == "submit_order"
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_get_customers_me_403_includes_step_diagnostics(mock_client_cls):
+    response = MagicMock()
+    response.status_code = 403
+    response.text = '{"error":{"message":"Forbidden resource"}}'
+    response.json.return_value = {"error": {"message": "Forbidden resource"}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {
+        "Authorization": "Bearer secret-access-token-value",
+        "User-Agent": "AI-Trading-Bot/0.1",
+    }
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    with pytest.raises(SandboxApiError) as exc:
+        adapter.get_customers_me()
+
+    diag = exc.value.step_diagnostics
+    assert diag is not None
+    assert diag.step == "get_customers_me"
+    assert diag.status_code == 403
+    assert diag.endpoint_path == "/customers/me"
+    assert diag.authorization_present is True
+    assert diag.user_agent_present is True
+    safe = diag.format_safe()
+    assert "secret-access-token-value" not in safe
+    assert "Bearer secret" not in safe
+    assert "403 usually means" in safe
 
 
 def test_execute_order_rejects_sell():

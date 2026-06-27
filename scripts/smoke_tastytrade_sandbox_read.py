@@ -17,6 +17,7 @@ from backend.adapters.broker.sandbox_env import (
     sandbox_env_flags,
     sandbox_env_ready_for_read,
 )
+from backend.adapters.broker.sandbox_step_diagnostics import StepFailureDiagnostics
 from backend.adapters.broker.tastytrade_sandbox import SandboxApiError, TastytradeSandboxAdapter
 from backend.config.settings import ConfigurationError, load_settings, reset_settings_cache
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, assert_sandbox_base_url
@@ -42,7 +43,15 @@ def _validate_sandbox_env():
     return settings
 
 
+def _print_step_failure(diagnostics: StepFailureDiagnostics) -> None:
+    print("error: sandbox step failed", file=sys.stderr)
+    print(diagnostics.format_safe(), file=sys.stderr)
+
+
 def _print_auth_error(exc: SandboxAuthError) -> None:
+    if exc.step_diagnostics:
+        _print_step_failure(exc.step_diagnostics)
+        return
     print("error: authentication failed", file=sys.stderr)
     if exc.diagnostics:
         print(exc.diagnostics.format_safe(), file=sys.stderr)
@@ -54,13 +63,11 @@ def _print_auth_error(exc: SandboxAuthError) -> None:
 
 
 def _print_api_error(exc: SandboxApiError) -> None:
+    if exc.step_diagnostics:
+        _print_step_failure(exc.step_diagnostics)
+        return
     print(f"error: sandbox API failed (status {exc.status_code})", file=sys.stderr)
     print(exc.message, file=sys.stderr)
-    if exc.status_code == 422:
-        print(
-            "Next step: valid symbols may lag in sandbox instrumentation — retry later.",
-            file=sys.stderr,
-        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,6 +92,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         adapter._auth.ensure_authenticated()
+    except SandboxAuthError as exc:
+        _print_auth_error(exc)
+        return 1
+
+    try:
+        adapter.get_customers_me()
+    except SandboxApiError as exc:
+        _print_api_error(exc)
+        return 1
     except SandboxAuthError as exc:
         _print_auth_error(exc)
         return 1

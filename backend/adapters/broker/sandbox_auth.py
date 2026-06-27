@@ -12,8 +12,11 @@ from backend.adapters.broker.oauth_diagnostics import (
     REFRESH_GRANT_TYPE,
     OAuthFailureDiagnostics,
     build_oauth_diagnostics,
-    oauth_next_step_hint,
     redact_oauth_body,
+)
+from backend.adapters.broker.sandbox_step_diagnostics import (
+    StepFailureDiagnostics,
+    build_step_failure,
 )
 from backend.config.settings import Settings
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, USER_AGENT, assert_sandbox_base_url
@@ -31,9 +34,11 @@ class SandboxAuthError(RuntimeError):
         message: str,
         *,
         diagnostics: Optional[OAuthFailureDiagnostics] = None,
+        step_diagnostics: Optional[StepFailureDiagnostics] = None,
     ) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics
+        self.step_diagnostics = step_diagnostics
 
 
 class SandboxOAuthClient:
@@ -168,6 +173,18 @@ class SandboxOAuthClient:
 
         if response.status_code >= 400:
             self._oauth_failed = True
+            oauth_headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            }
+            step_diag = build_step_failure(
+                step="oauth_token",
+                status_code=response.status_code,
+                endpoint_path=OAUTH_TOKEN_PATH,
+                request_headers=oauth_headers,
+                response_text=response.text,
+            )
             diagnostics = build_oauth_diagnostics(
                 status_code=response.status_code,
                 response_text=response.text,
@@ -179,13 +196,12 @@ class SandboxOAuthClient:
             )
             logger.debug(
                 "Sandbox OAuth failed\n%s",
-                diagnostics.format_safe(),
+                step_diag.format_safe(),
             )
-            hint = oauth_next_step_hint(diagnostics)
             raise SandboxAuthError(
-                f"Sandbox OAuth failed ({response.status_code}).\n"
-                f"{diagnostics.format_safe()}\n{hint}",
+                f"Sandbox OAuth failed ({response.status_code}).",
                 diagnostics=diagnostics,
+                step_diagnostics=step_diag,
             )
 
         data = self._parse_token_response(response)

@@ -91,10 +91,12 @@ def test_read_script_runs_env_checker_first():
     text = READ_SCRIPT.read_text(encoding="utf-8")
     assert "sandbox_env_flags" in text or "format_sandbox_env_report" in text
     assert "ensure_authenticated" in text
+    assert "get_customers_me" in text
     env_pos = text.find("sandbox_env")
     auth_pos = text.find("ensure_authenticated")
+    customers_pos = text.find("get_customers_me")
     accounts_pos = text.find("get_accounts")
-    assert env_pos < auth_pos < accounts_pos
+    assert env_pos < auth_pos < customers_pos < accounts_pos
 
 
 def test_read_script_rejects_unsafe_env_missing_secret(monkeypatch, capsys):
@@ -106,3 +108,97 @@ def test_read_script_rejects_unsafe_env_missing_secret(monkeypatch, capsys):
     reset_settings_cache()
     mod = _load_module(READ_SCRIPT, "smoke_read_env")
     assert mod.main([]) != 0
+
+
+def test_read_smoke_403_output_includes_step_name(monkeypatch, capsys):
+    from backend.adapters.broker.sandbox_step_diagnostics import StepFailureDiagnostics
+    from backend.adapters.broker.tastytrade_sandbox import SandboxApiError
+
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(READ_SCRIPT, "smoke_read_403")
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    diag = StepFailureDiagnostics(
+        step="get_customers_me",
+        status_code=403,
+        endpoint_path="/customers/me",
+        authorization_present=True,
+        user_agent_present=True,
+        provider_message="Forbidden",
+    )
+    exc = SandboxApiError(403, "forbidden", step_diagnostics=diag)
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            raise exc
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main([]) == 1
+
+    err = capsys.readouterr().err
+    assert "step: get_customers_me" in err
+    assert "status_code: 403" in err
+    assert "403 usually means" in err
+    assert "Authorization header present: true" in err
+    assert "Bearer secret" not in err
+
+
+def test_read_smoke_never_prints_authorization_value(monkeypatch, capsys):
+    from backend.adapters.broker.sandbox_step_diagnostics import StepFailureDiagnostics
+    from backend.adapters.broker.tastytrade_sandbox import SandboxApiError
+
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "super-secret-client-secret")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "super-secret-refresh-token")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(READ_SCRIPT, "smoke_read_secrets")
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    diag = StepFailureDiagnostics(
+        step="get_accounts",
+        status_code=403,
+        endpoint_path="/customers/me/accounts",
+        authorization_present=True,
+        user_agent_present=True,
+        provider_message="Not allowed",
+    )
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            raise SandboxApiError(403, "forbidden", step_diagnostics=diag)
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    mod.main([])
+
+    err = capsys.readouterr().err
+    assert "super-secret-client-secret" not in err
+    assert "super-secret-refresh-token" not in err
+    assert "Authorization: Bearer" not in err
