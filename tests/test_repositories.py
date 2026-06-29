@@ -45,6 +45,34 @@ def test_order_repository_lifecycle(db_session):
     assert len(recent) == 1
 
 
+def test_order_repository_finalize_execution_stores_sandbox_fields(db_session):
+    repo = OrderRepository(db_session)
+    repo.create_pending_order(
+        order_id="PENDING-1",
+        mode="sandbox",
+        symbol="TNA",
+        side="buy",
+        quantity=1,
+        order_type="Limit",
+        limit_price=2.0,
+    )
+    record = repo.finalize_execution(
+        "PENDING-1",
+        "SANDBOX-1159360",
+        status="filled",
+        fill_price=2.0,
+        limit_price=2.0,
+        broker_order_id="1159360",
+        raw={"route": "sandbox", "broker_order_id": "1159360"},
+    )
+    assert record is not None
+    assert record.order_id == "SANDBOX-1159360"
+    assert record.broker_order_id == "1159360"
+    assert record.limit_price == 2.0
+    assert record.mode == "sandbox"
+    assert record.status == "filled"
+
+
 def test_decision_repository_logs_risk_rejection(db_session):
     repo = DecisionRepository(db_session)
     record = repo.log_risk_rejection(

@@ -171,7 +171,8 @@ class OrderExecutor:
                 side=intent.side,
                 quantity=intent.quantity,
                 order_type=intent.order_type,
-                message="pending paper execution",
+                limit_price=intent.limit_price,
+                message="pending execution",
             )
         except Exception as exc:
             self._log_error("order_executor.pending_order_log", exc)
@@ -185,11 +186,18 @@ class OrderExecutor:
         if not self._orders:
             return
         try:
-            if result.status == "filled" and result.success and result.order_id:
-                self._orders.finalize_paper_fill(
+            if result.status in {"filled", "submitted", "live"} and result.success and result.order_id:
+                broker_order_id = (result.raw or {}).get("broker_order_id")
+                record_status = (result.raw or {}).get("record_status") or result.status
+                if record_status == "live":
+                    record_status = "submitted"
+                self._orders.finalize_execution(
                     pending_order_id,
                     result.order_id,
-                    fill_price=float(result.fill_price or 0),
+                    status=record_status,
+                    fill_price=result.fill_price,
+                    limit_price=intent.limit_price,
+                    broker_order_id=str(broker_order_id) if broker_order_id else None,
                     raw=result.raw,
                 )
             elif result.status == "rejected":
@@ -201,6 +209,8 @@ class OrderExecutor:
                     symbol=result.symbol,
                     side=result.side,
                     quantity=result.quantity,
+                    order_type=intent.order_type,
+                    limit_price=intent.limit_price,
                     raw=result.raw,
                 )
             elif result.status == "error":

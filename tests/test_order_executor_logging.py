@@ -89,6 +89,56 @@ def test_executor_logs_risk_rejection(db_session):
     assert orders[0].symbol == "TNA"
 
 
+def test_executor_logs_sandbox_fill_with_limit_price(db_session, monkeypatch):
+    from backend.adapters.broker.tastytrade_sandbox import TastytradeSandboxAdapter
+    from backend.risk.models import ExecutionResult
+
+    class FakeSandboxAdapter:
+        def execute_order(self, intent):
+            return ExecutionResult(
+                success=True,
+                status="filled",
+                order_id="SANDBOX-1159360",
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=intent.quantity,
+                fill_price=2.0,
+                trading_mode="sandbox",
+                message="ok",
+                raw={"broker_order_id": "1159360", "record_status": "filled", "route": "sandbox"},
+            )
+
+    router = ExecutionRouter(sandbox_adapter=FakeSandboxAdapter())  # type: ignore[arg-type]
+    executor = OrderExecutor(
+        router=router,
+        order_repository=OrderRepository(db_session),
+        decision_repository=DecisionRepository(db_session),
+        error_repository=ErrorRepository(db_session),
+    )
+    intent = OrderIntent(
+        symbol="TNA",
+        side="buy",
+        quantity=1,
+        trading_mode="sandbox",
+        order_type="Limit",
+        limit_price=2.0,
+        current_price=50.0,
+        source="test",
+    )
+    from tests.execution_helpers import make_context
+
+    result = executor.execute(intent, make_context(trading_mode="sandbox"))
+    assert result.success is True
+
+    record = OrderRepository(db_session).get_by_order_id("SANDBOX-1159360")
+    assert record is not None
+    assert record.broker_order_id == "1159360"
+    assert record.limit_price == 2.0
+    assert record.mode == "sandbox"
+    assert record.order_type == "Limit"
+    assert record.status == "filled"
+
+
 def test_executor_logs_error_on_router_failure(db_session, monkeypatch):
     executor = _executor(db_session)
 

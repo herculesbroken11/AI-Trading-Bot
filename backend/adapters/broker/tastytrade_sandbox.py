@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError, SandboxOAuthClient
+from backend.adapters.broker.sandbox_order_verification import (
+    extract_broker_order_id,
+    summarize_order_response,
+)
 from backend.adapters.broker.sandbox_step_diagnostics import (
     StepFailureDiagnostics,
     build_step_failure,
@@ -27,7 +31,9 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 30.0
 CUSTOMERS_ME_ACCOUNTS_PATH = "/customers/me/accounts"
 EQUITY_BUY_ACTION = "Buy to Open"
+EQUITY_SELL_CLOSE_ACTION = "Sell to Close"
 PRICE_EFFECT_DEBIT = "Debit"
+PRICE_EFFECT_CREDIT = "Credit"
 
 
 def _coerce_amount(value: Any) -> Optional[float]:
@@ -82,6 +88,39 @@ def build_equity_order_payload(
     if normalized_type == "Limit":
         if limit_price is None:
             raise SandboxApiError(400, "Limit orders require limit_price")
+        payload["price"] = f"{float(limit_price):.2f}"
+    return payload
+
+
+def build_equity_close_payload(
+    *,
+    symbol: str,
+    quantity: int,
+    order_type: str = "Market",
+    time_in_force: str = "Day",
+    limit_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build Tastytrade equity close JSON (Sell to Close, sandbox smoke only)."""
+    normalized_type = order_type.strip().capitalize()
+    if normalized_type not in {"Market", "Limit"}:
+        raise SandboxApiError(400, f"Unsupported order_type {order_type!r} in Phase 2 sandbox adapter")
+
+    payload: Dict[str, Any] = {
+        "time-in-force": time_in_force,
+        "order-type": normalized_type,
+        "price-effect": PRICE_EFFECT_CREDIT,
+        "legs": [
+            {
+                "instrument-type": "Equity",
+                "symbol": symbol.strip().upper(),
+                "quantity": quantity,
+                "action": EQUITY_SELL_CLOSE_ACTION,
+            }
+        ],
+    }
+    if normalized_type == "Limit":
+        if limit_price is None:
+            raise SandboxApiError(400, "Limit close orders require limit_price")
         payload["price"] = f"{float(limit_price):.2f}"
     return payload
 
@@ -200,6 +239,20 @@ class TastytradeSandboxAdapter:
             raise SandboxApiError(400, "Limit orders require limit_price")
         return symbol, order_type
 
+    def _validate_equity_close(self, symbol: str, quantity: int, order_type: str, limit_price: Optional[float]) -> str:
+        symbol = symbol.strip().upper()
+        order_type = order_type.strip().capitalize()
+        if symbol not in ALLOWED_SANDBOX_SYMBOLS:
+            raise SandboxApiError(400, f"Symbol {symbol!r} not allowed in Phase 2 sandbox adapter")
+        if quantity <= 0 or quantity > SANDBOX_MAX_ORDER_QUANTITY:
+            raise SandboxApiError(
+                400,
+                f"Sandbox quantity must be 1..{SANDBOX_MAX_ORDER_QUANTITY}, got {quantity}",
+            )
+        if order_type == "Limit" and limit_price is None:
+            raise SandboxApiError(400, "Limit close orders require limit_price")
+        return symbol
+
     def _post_equity_order(
         self,
         account_number: Optional[str],
@@ -225,6 +278,32 @@ class TastytradeSandboxAdapter:
         )
         suffix = "/dry-run" if dry_run else ""
         step = "dry_run_order" if dry_run else "submit_order"
+        path = f"/accounts/{acct}/orders{suffix}"
+        response = self._request("POST", path, step=step, json=order_data)
+        return response.json()
+
+    def _post_equity_close(
+        self,
+        account_number: Optional[str],
+        *,
+        symbol: str,
+        quantity: int,
+        order_type: str,
+        time_in_force: str,
+        limit_price: Optional[float],
+        dry_run: bool,
+    ) -> Dict[str, Any]:
+        symbol = self._validate_equity_close(symbol, quantity, order_type, limit_price)
+        acct = self._resolve_account_number(account_number)
+        order_data = build_equity_close_payload(
+            symbol=symbol,
+            quantity=quantity,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+        )
+        suffix = "/dry-run" if dry_run else ""
+        step = "dry_run_close" if dry_run else "submit_close"
         path = f"/accounts/{acct}/orders{suffix}"
         response = self._request("POST", path, step=step, json=order_data)
         return response.json()
@@ -345,6 +424,57 @@ class TastytradeSandboxAdapter:
         response = self._request("GET", path, step="get_order")
         return response.json()
 
+    def fetch_order_status_summary(
+        self,
+        account_number: Optional[str],
+        order_id: str,
+    ) -> Dict[str, Any]:
+        """Fetch broker order and return a safe summary dict."""
+        response = self.get_order(account_number, order_id)
+        return summarize_order_response(response)
+
+    def dry_run_equity_close(
+        self,
+        account_number: Optional[str],
+        symbol: str,
+        quantity: int,
+        order_type: str = "Market",
+        time_in_force: str = "Day",
+        limit_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Preflight close via POST /accounts/{account}/orders/dry-run."""
+        self._auth.ensure_authenticated()
+        return self._post_equity_close(
+            account_number,
+            symbol=symbol,
+            quantity=quantity,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+            dry_run=True,
+        )
+
+    def submit_equity_close(
+        self,
+        account_number: Optional[str],
+        symbol: str,
+        quantity: int,
+        order_type: str = "Market",
+        time_in_force: str = "Day",
+        limit_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Submit close order via POST /accounts/{account}/orders."""
+        self._auth.ensure_authenticated()
+        return self._post_equity_close(
+            account_number,
+            symbol=symbol,
+            quantity=quantity,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+            dry_run=False,
+        )
+
     def execute_order(self, intent: OrderIntent) -> ExecutionResult:
         """Submit sandbox order and return ExecutionResult (for ExecutionRouter)."""
         symbol = intent.symbol.strip().upper()
@@ -361,17 +491,29 @@ class TastytradeSandboxAdapter:
                 order_type=order_type,
                 limit_price=intent.limit_price,
             )
+            broker_order_id = extract_broker_order_id(result)
             order_data = result.get("data", {}).get("order") or result.get("data", {})
-            order_id = str(
+            order_id = broker_order_id or str(
                 order_data.get("id")
                 or order_data.get("order-id")
                 or result.get("data", {}).get("id")
-                or "SANDBOX-UNKNOWN"
+                or "UNKNOWN"
             )
             fill_price = intent.limit_price if order_type == "Limit" else intent.current_price
+            broker_status = None
+            record_status = "filled"
+            if broker_order_id:
+                try:
+                    status_summary = self.fetch_order_status_summary(None, broker_order_id)
+                    broker_status = status_summary.get("broker_status")
+                    record_status = status_summary.get("status") or record_status
+                    if status_summary.get("fill_price") is not None:
+                        fill_price = status_summary["fill_price"]
+                except SandboxApiError:
+                    logger.warning("sandbox get_order status fetch failed for order %s", order_id)
             return ExecutionResult(
                 success=True,
-                status="filled",
+                status=record_status if record_status in {"filled", "submitted", "live"} else "filled",
                 order_id=f"SANDBOX-{order_id}",
                 symbol=symbol,
                 side=side,
@@ -382,7 +524,13 @@ class TastytradeSandboxAdapter:
                     "Sandbox order submitted. Market orders in sandbox may fill at $1 — "
                     "not representative of real market fills."
                 ),
-                raw={"route": "sandbox", "placed": True, "broker_order_id": order_id},
+                raw={
+                    "route": "sandbox",
+                    "placed": True,
+                    "broker_order_id": broker_order_id,
+                    "broker_status": broker_status,
+                    "record_status": record_status,
+                },
             )
         except SandboxApiError as exc:
             status = "rejected" if exc.status_code == 422 else "error"

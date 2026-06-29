@@ -13,61 +13,28 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError
-from backend.adapters.broker.sandbox_env import (
-    format_sandbox_env_report,
-    sandbox_env_flags,
-    sandbox_env_ready_for_read,
-)
 from backend.adapters.broker.tastytrade_sandbox import SandboxApiError, TastytradeSandboxAdapter
-from backend.config.settings import ConfigurationError, load_settings, reset_settings_cache
-from backend.config.tastytrade_urls import SANDBOX_BASE_URL, assert_sandbox_base_url
+from backend.config.settings import ConfigurationError
 from backend.execution.execution_router import ExecutionRouter
 from backend.execution.order_executor import OrderExecutor
+from backend.repositories.order_repository import OrderRepository
 from backend.risk.models import OrderIntent, RiskContext
 from backend.risk.risk_engine import RiskEngine
+from scripts.sandbox_smoke_common import (
+    fetch_account_state,
+    print_api_error,
+    print_auth_error,
+    print_db_order_summary,
+    print_env_check,
+    validate_sandbox_env,
+    verify_order_after_submit,
+    verify_position_after_buy,
+)
 
 WARNING = (
     "This is sandbox only. Sandbox market orders may fill at $1 and do not "
     "represent real market fills. Limit orders below $3 fill immediately in sandbox."
 )
-
-
-def _validate_env():
-    reset_settings_cache()
-    settings = load_settings()
-    if settings.trading_mode.strip().lower() != "sandbox":
-        raise ConfigurationError("Sandbox order smoke requires TRADING_MODE=sandbox")
-    if settings.tastytrade_env.strip().lower() != "sandbox":
-        raise ConfigurationError("Sandbox order smoke requires TASTYTRADE_ENV=sandbox")
-    if settings.live_trading_enabled:
-        raise ConfigurationError("LIVE_TRADING_ENABLED must be false")
-    if settings.emergency_halt:
-        raise ConfigurationError("EMERGENCY_HALT must be false")
-    assert_sandbox_base_url(SANDBOX_BASE_URL)
-    return settings
-
-
-def _print_env_check(settings) -> bool:
-    flags = sandbox_env_flags(settings)
-    print("--- sandbox env check ---")
-    print(format_sandbox_env_report(flags))
-    return sandbox_env_ready_for_read(flags)
-
-
-def _print_api_error(exc: SandboxApiError) -> None:
-    print("error: sandbox step failed", file=sys.stderr)
-    if exc.step_diagnostics:
-        print(exc.step_diagnostics.format_safe(), file=sys.stderr)
-    else:
-        print(exc.message, file=sys.stderr)
-
-
-def _print_auth_error(exc: SandboxAuthError) -> None:
-    print("error: authentication failed", file=sys.stderr)
-    if exc.step_diagnostics:
-        print(exc.step_diagnostics.format_safe(), file=sys.stderr)
-    else:
-        print(str(exc), file=sys.stderr)
 
 
 def _coerce_balance_amount(value) -> Optional[float]:
@@ -105,41 +72,34 @@ def _build_context(settings, price: float, balance: dict, positions_count: int) 
     )
 
 
-def _build_executor(settings, adapter: TastytradeSandboxAdapter, with_db: bool) -> OrderExecutor:
+def _build_executor(
+    settings,
+    adapter: TastytradeSandboxAdapter,
+    with_db: bool,
+) -> tuple[OrderExecutor, Optional[OrderRepository]]:
     router = ExecutionRouter(sandbox_adapter=adapter)
     risk = RiskEngine()
 
     if not with_db:
-        return OrderExecutor(risk_engine=risk, router=router)
+        return OrderExecutor(risk_engine=risk, router=router), None
 
     from backend.db.session import configure_engine, get_db_session
     from backend.repositories.decision_repository import DecisionRepository
     from backend.repositories.error_repository import ErrorRepository
-    from backend.repositories.order_repository import OrderRepository
 
     configure_engine(settings.database_url, sql_echo=settings.sql_echo)
     session = get_db_session()
-    return OrderExecutor(
-        risk_engine=risk,
-        router=router,
-        order_repository=OrderRepository(session),
-        decision_repository=DecisionRepository(session),
-        error_repository=ErrorRepository(session),
+    order_repo = OrderRepository(session)
+    return (
+        OrderExecutor(
+            risk_engine=risk,
+            router=router,
+            order_repository=order_repo,
+            decision_repository=DecisionRepository(session),
+            error_repository=ErrorRepository(session),
+        ),
+        order_repo,
     )
-
-
-def _fetch_account_state(adapter: TastytradeSandboxAdapter) -> tuple[dict, int]:
-    adapter._auth.ensure_authenticated()
-    adapter.get_customers_me()
-    accounts = adapter.get_accounts()
-    if not accounts:
-        raise SandboxApiError(
-            404,
-            "No sandbox accounts returned",
-        )
-    balance = adapter.get_balance()
-    positions = adapter.get_positions(balance.get("account_number"))
-    return balance, len(positions)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,6 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--with-db", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.with_db and args.no_db:
+        print("error: use either --with-db or --no-db, not both", file=sys.stderr)
+        return 2
+
     if args.quantity != 1:
         print("error: sandbox smoke quantity must be 1 in Phase 2", file=sys.stderr)
         return 2
@@ -171,26 +135,27 @@ def main(argv: list[str] | None = None) -> int:
     print(f"warning: {WARNING}")
 
     try:
-        settings = _validate_env()
+        settings = validate_sandbox_env(script_name="smoke_tastytrade_sandbox_order")
     except ConfigurationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if not _print_env_check(settings):
+    if not print_env_check(settings):
         print("error: sandbox env check failed", file=sys.stderr)
         return 2
 
     adapter = TastytradeSandboxAdapter(settings)
 
     try:
-        balance, positions_count = _fetch_account_state(adapter)
+        balance, positions = fetch_account_state(adapter)
     except (SandboxApiError, SandboxAuthError) as exc:
         if isinstance(exc, SandboxApiError):
-            _print_api_error(exc)
+            print_api_error(exc)
         else:
-            _print_auth_error(exc)
+            print_auth_error(exc)
         return 1
 
+    positions_count = len(positions)
     print(f"selected_account: {balance.get('account_number')}")
     print(f"buying_power: {balance.get('buying_power')}")
     print(f"cash_balance: {balance.get('cash_balance')}")
@@ -225,10 +190,10 @@ def main(argv: list[str] | None = None) -> int:
             limit_price=args.limit_price,
         )
     except SandboxApiError as exc:
-        _print_api_error(exc)
+        print_api_error(exc)
         return 1
     except SandboxAuthError as exc:
-        _print_auth_error(exc)
+        print_auth_error(exc)
         return 1
 
     print("dry_run: passed")
@@ -237,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         print("info: dry-run passed; re-run with --confirm-sandbox-order to submit", file=sys.stderr)
         return 0
 
-    executor = _build_executor(settings, adapter, with_db)
+    executor, order_repo = _build_executor(settings, adapter, with_db)
     result = executor.execute(intent, context)
 
     print(f"status: {result.status}")
@@ -249,7 +214,22 @@ def main(argv: list[str] | None = None) -> int:
     print(f"fill_price: {result.fill_price}")
     print(f"trading_mode: {result.trading_mode}")
     print(f"message: {result.message}")
-    return 0 if result.success else 1
+
+    if not result.success:
+        return 1
+
+    exit_code = verify_order_after_submit(
+        adapter,
+        balance.get("account_number"),
+        order_id=result.order_id,
+        raw=result.raw,
+    )
+    verify_position_after_buy(adapter, balance.get("account_number"), args.symbol)
+
+    if with_db and order_repo and result.order_id:
+        print_db_order_summary(order_repo, result.order_id)
+
+    return exit_code
 
 
 if __name__ == "__main__":

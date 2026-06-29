@@ -273,10 +273,77 @@ def test_get_customers_me_403_includes_step_diagnostics(mock_client_cls):
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_get_order_returns_summary(mock_client_cls):
+    order_response = MagicMock()
+    order_response.status_code = 200
+    order_response.json.return_value = {
+        "data": {
+            "id": 1159360,
+            "status": "Filled",
+            "order-type": "Limit",
+            "price": "2.00",
+            "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+        }
+    }
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = order_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    summary = adapter.fetch_order_status_summary("5WM30541", "1159360")
+    assert summary["broker_order_id"] == "1159360"
+    assert summary["status"] == "filled"
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders/1159360"
+    assert "api.tastyworks.com" not in called_url or "cert.tastyworks" in called_url
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_dry_run_close_uses_dry_run_endpoint(mock_client_cls):
+    dry_response = MagicMock()
+    dry_response.status_code = 200
+    dry_response.json.return_value = {"data": {}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = dry_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    adapter.dry_run_equity_close("5WM30541", "TNA", 1)
+
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders/dry-run"
+    payload = mock_client.request.call_args.kwargs["json"]
+    assert payload["legs"][0]["action"] == "Sell to Close"
+    assert payload["price-effect"] == "Credit"
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
 def test_execute_order_passes_limit_price(mock_client_cls):
     submit_response = MagicMock()
     submit_response.status_code = 200
-    submit_response.json.return_value = {"data": {"order": {"id": "456"}}}
+    submit_response.json.return_value = {"data": {"order": {"id": "456", "status": "Filled"}}}
+
+    status_response = MagicMock()
+    status_response.status_code = 200
+    status_response.json.return_value = {
+        "data": {
+            "id": 456,
+            "status": "Filled",
+            "order-type": "Limit",
+            "price": "2.00",
+            "legs": [{"symbol": "TZA", "quantity": 1, "action": "Buy to Open"}],
+        }
+    }
 
     accounts_response = MagicMock()
     accounts_response.status_code = 200
@@ -286,7 +353,7 @@ def test_execute_order_passes_limit_price(mock_client_cls):
 
     mock_client = MagicMock()
     mock_client.__enter__.return_value = mock_client
-    mock_client.request.side_effect = [accounts_response, submit_response]
+    mock_client.request.side_effect = [accounts_response, submit_response, status_response]
     mock_client_cls.return_value = mock_client
 
     auth = MagicMock(spec=SandboxOAuthClient)
@@ -305,10 +372,11 @@ def test_execute_order_passes_limit_price(mock_client_cls):
     result = adapter.execute_order(intent)
 
     assert result.success is True
-    payload = mock_client.request.call_args_list[-1].kwargs["json"]
-    assert payload["price"] == "2.00"
-    assert payload["price-effect"] == "Debit"
-    assert payload["order-type"] == "Limit"
+    submit_payload = mock_client.request.call_args_list[1].kwargs["json"]
+    assert submit_payload["price"] == "2.00"
+    assert submit_payload["price-effect"] == "Debit"
+    assert submit_payload["order-type"] == "Limit"
+    assert result.raw["broker_order_id"] == "456"
 
 
 def test_execute_order_rejects_sell():

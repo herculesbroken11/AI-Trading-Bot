@@ -24,7 +24,8 @@ class OrderRecord(Base):
     side = Column(String, nullable=False)
     quantity = Column(Integer, nullable=False)
     order_type = Column(String, default="Market")
-    status = Column(String, nullable=False)  # pending | filled | rejected | error
+    status = Column(String, nullable=False)  # pending | submitted | filled | rejected | error | cancelled
+    limit_price = Column(Float, nullable=True)
     fill_price = Column(Float, nullable=True)
     rejection_code = Column(String, nullable=True)
     message = Column(Text, nullable=True)

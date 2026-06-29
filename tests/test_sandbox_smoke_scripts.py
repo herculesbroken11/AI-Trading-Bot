@@ -12,6 +12,7 @@ from backend.config.settings import reset_settings_cache
 REPO_ROOT = Path(__file__).resolve().parents[1]
 READ_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_read.py"
 ORDER_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_order.py"
+CLOSE_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_close.py"
 
 
 def _load_module(path: Path, name: str):
@@ -130,6 +131,20 @@ def test_order_script_submit_requires_confirm_flag(monkeypatch):
         def dry_run_equity_order(self, *args, **kwargs):
             return {"data": {}}
 
+        def fetch_order_status_summary(self, account_number, order_id):
+            return {
+                "broker_order_id": order_id,
+                "broker_status": "Filled",
+                "status": "filled",
+                "symbol": "TNA",
+                "side": "buy",
+                "quantity": 1,
+                "order_type": "Market",
+                "limit_price": None,
+                "fill_price": 1.0,
+                "trading_mode": "sandbox",
+            }
+
     class FakeExecutor:
         def execute(self, intent, context):
             execute_called["value"] = True
@@ -144,6 +159,7 @@ def test_order_script_submit_requires_confirm_flag(monkeypatch):
                 quantity=1,
                 trading_mode="sandbox",
                 message="ok",
+                raw={"broker_order_id": "1"},
             )
 
     monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
@@ -267,6 +283,119 @@ def test_read_script_does_not_submit_orders():
     assert "submit_equity_order" not in text
     assert "OrderExecutor" not in text
     assert "/orders" not in text
+
+
+def test_close_script_requires_confirm_flag(monkeypatch, capsys):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CLOSE_SCRIPT, "smoke_close_dry_only")
+    submit_called = {"value": False}
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541", "buying_power": 100000.0, "cash_balance": 100000.0}
+
+        def get_positions(self, account_number):
+            return [{"symbol": "TNA", "quantity": 1}]
+
+        def dry_run_equity_close(self, *args, **kwargs):
+            return {"data": {}}
+
+        def submit_equity_close(self, *args, **kwargs):
+            submit_called["value"] = True
+            return {"data": {"id": 1}}
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main(["--symbol", "TNA"]) == 0
+    assert submit_called["value"] is False
+    assert "dry_run: passed" in capsys.readouterr().out
+
+
+def test_close_script_submit_requires_confirm(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CLOSE_SCRIPT, "smoke_close_confirm")
+    submit_called = {"value": False}
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541"}
+
+        def get_positions(self, account_number):
+            return [{"symbol": "TNA", "quantity": 1}]
+
+        def dry_run_equity_close(self, *args, **kwargs):
+            return {"data": {}}
+
+        def submit_equity_close(self, *args, **kwargs):
+            submit_called["value"] = True
+            return {"data": {"id": 99, "status": "Filled", "legs": [{"symbol": "TNA", "action": "Sell to Close"}]}}
+
+        def fetch_order_status_summary(self, account_number, order_id):
+            return {
+                "broker_order_id": order_id,
+                "broker_status": "Filled",
+                "status": "filled",
+                "symbol": "TNA",
+                "side": "sell",
+                "quantity": 1,
+                "order_type": "Market",
+                "limit_price": None,
+                "fill_price": 2.0,
+                "trading_mode": "sandbox",
+            }
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main(["--symbol", "TNA", "--confirm-sandbox-close"]) == 0
+    assert submit_called["value"] is True
+
+
+def test_close_script_no_trade_exec_import():
+    text = CLOSE_SCRIPT.read_text(encoding="utf-8")
+    imports = [l for l in text.splitlines() if l.strip().startswith(("import ", "from "))]
+    joined = "\n".join(imports)
+    assert "trade_exec" not in joined
+    assert "OrderExecutor" not in joined
 
 
 def test_order_script_build_context_handles_string_buying_power():

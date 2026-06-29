@@ -34,6 +34,7 @@ def test_smoke_scripts_no_trade_exec():
     for script in [
         Path("scripts/smoke_tastytrade_sandbox_read.py"),
         Path("scripts/smoke_tastytrade_sandbox_order.py"),
+        Path("scripts/smoke_tastytrade_sandbox_close.py"),
     ]:
         imports = _import_lines(script)
         assert "trade_exec" not in imports
