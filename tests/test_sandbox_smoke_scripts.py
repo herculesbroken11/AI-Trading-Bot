@@ -269,6 +269,24 @@ def test_read_script_does_not_submit_orders():
     assert "/orders" not in text
 
 
+def test_order_script_build_context_handles_string_buying_power():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(REPO_ROOT))
+    from scripts.smoke_tastytrade_sandbox_order import _build_context
+    from backend.config.settings import Settings
+
+    settings = Settings(trading_mode="sandbox", tastytrade_env="sandbox")
+    context = _build_context(
+        settings,
+        50.0,
+        {"buying_power": "0.0", "cash_balance": "100000.0"},
+        0,
+    )
+    assert context.buying_power == 100000.0
+
+
 def test_order_script_uses_dry_run_before_submit():
     text = ORDER_SCRIPT.read_text(encoding="utf-8")
     assert "dry_run_equity_order" in text

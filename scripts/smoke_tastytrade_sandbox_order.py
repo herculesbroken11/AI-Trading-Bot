@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -69,10 +70,19 @@ def _print_auth_error(exc: SandboxAuthError) -> None:
         print(str(exc), file=sys.stderr)
 
 
+def _coerce_balance_amount(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_context(settings, price: float, balance: dict, positions_count: int) -> RiskContext:
-    buying_power = balance.get("buying_power")
+    buying_power = _coerce_balance_amount(balance.get("buying_power"))
     if buying_power is None or buying_power <= 0:
-        buying_power = balance.get("cash_balance") or 10_000.0
+        buying_power = _coerce_balance_amount(balance.get("cash_balance")) or 10_000.0
     return RiskContext(
         trading_mode="sandbox",
         live_trading_enabled=False,

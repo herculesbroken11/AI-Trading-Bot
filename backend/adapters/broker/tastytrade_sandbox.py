@@ -29,6 +29,16 @@ CUSTOMERS_ME_ACCOUNTS_PATH = "/customers/me/accounts"
 EQUITY_BUY_ACTION = "Buy to Open"
 
 
+def _coerce_amount(value: Any) -> Optional[float]:
+    """Coerce Tastytrade balance fields (may be str) to float."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class SandboxApiError(Exception):
     status_code: int
@@ -268,9 +278,11 @@ class TastytradeSandboxAdapter:
         payload = response.json().get("data", {})
         return {
             "account_number": acct,
-            "cash_balance": payload.get("cash-balance"),
-            "buying_power": payload.get("day-trading-buying-power") or payload.get("equity-buying-power"),
-            "day_pnl": payload.get("day-pnl"),
+            "cash_balance": _coerce_amount(payload.get("cash-balance")),
+            "buying_power": _coerce_amount(
+                payload.get("day-trading-buying-power") or payload.get("equity-buying-power")
+            ),
+            "day_pnl": _coerce_amount(payload.get("day-pnl")),
         }
 
     def get_positions(self, account_number: Optional[str] = None) -> List[Dict[str, Any]]:

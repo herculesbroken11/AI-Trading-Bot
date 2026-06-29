@@ -7,6 +7,8 @@ import pytest
 from backend.adapters.broker.tastytrade_sandbox import (
     EQUITY_BUY_ACTION,
     SandboxApiError,
+    TastytradeSandboxAdapter,
+    _coerce_amount,
     build_equity_order_payload,
 )
 
@@ -42,3 +44,9 @@ def test_limit_requires_price():
 def test_payload_does_not_use_plain_buy_action():
     payload = build_equity_order_payload(symbol="TNA", quantity=1)
     assert payload["legs"][0]["action"] != "Buy"
+
+
+def test_coerce_amount_parses_string_numbers():
+    assert _coerce_amount("100000.0") == 100000.0
+    assert _coerce_amount("0") == 0.0
+    assert _coerce_amount(None) is None
