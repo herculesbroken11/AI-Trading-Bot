@@ -272,6 +272,45 @@ def test_get_customers_me_403_includes_step_diagnostics(mock_client_cls):
     assert "403 usually means" in safe
 
 
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_execute_order_passes_limit_price(mock_client_cls):
+    submit_response = MagicMock()
+    submit_response.status_code = 200
+    submit_response.json.return_value = {"data": {"order": {"id": "456"}}}
+
+    accounts_response = MagicMock()
+    accounts_response.status_code = 200
+    accounts_response.json.return_value = {
+        "data": {"items": [{"account-number": "5WM30541"}]}
+    }
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.side_effect = [accounts_response, submit_response]
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    intent = OrderIntent(
+        symbol="TZA",
+        side="buy",
+        quantity=1,
+        trading_mode="sandbox",
+        order_type="Limit",
+        limit_price=2.0,
+        current_price=50.0,
+    )
+    result = adapter.execute_order(intent)
+
+    assert result.success is True
+    payload = mock_client.request.call_args_list[-1].kwargs["json"]
+    assert payload["price"] == "2.00"
+    assert payload["price-effect"] == "Debit"
+    assert payload["order-type"] == "Limit"
+
+
 def test_execute_order_rejects_sell():
     auth = MagicMock(spec=SandboxOAuthClient)
     adapter = TastytradeSandboxAdapter(_settings(), auth=auth)

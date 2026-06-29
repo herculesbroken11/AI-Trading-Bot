@@ -21,6 +21,7 @@ class OrderIntent:
     quantity: int
     trading_mode: str
     order_type: str = "Market"
+    limit_price: Optional[float] = None
     source: str = "manual"
     reason: str = ""
     current_price: Optional[float] = None
@@ -52,6 +53,16 @@ class OrderIntent:
             raise OrderIntentValidationError(
                 f"current_price must be positive when set, got {self.current_price}"
             )
+        order_type = self.order_type.strip().capitalize()
+        if order_type == "Limit":
+            if self.limit_price is None:
+                raise OrderIntentValidationError(
+                    "limit_price is required when order_type is Limit"
+                )
+            if self.limit_price <= 0:
+                raise OrderIntentValidationError(
+                    f"limit_price must be positive, got {self.limit_price}"
+                )
 
 
 @dataclass

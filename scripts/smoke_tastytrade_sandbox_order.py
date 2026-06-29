@@ -203,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         quantity=1,
         trading_mode="sandbox",
         order_type=order_type,
+        limit_price=args.limit_price,
         source="smoke_tastytrade_sandbox_order",
         reason="sandbox order smoke",
         current_price=args.price,

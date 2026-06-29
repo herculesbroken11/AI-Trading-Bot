@@ -44,6 +44,7 @@ class RiskEngine:
             quantity=intent.quantity,
             trading_mode=intent.trading_mode.strip().lower(),
             order_type=intent.order_type,
+            limit_price=intent.limit_price,
             source=intent.source,
             reason=intent.reason,
             current_price=intent.current_price,

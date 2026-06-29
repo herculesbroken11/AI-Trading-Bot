@@ -359,6 +359,7 @@ class TastytradeSandboxAdapter:
                 side=side,
                 quantity=intent.quantity,
                 order_type=order_type,
+                limit_price=intent.limit_price,
             )
             order_data = result.get("data", {}).get("order") or result.get("data", {})
             order_id = str(
@@ -367,7 +368,7 @@ class TastytradeSandboxAdapter:
                 or result.get("data", {}).get("id")
                 or "SANDBOX-UNKNOWN"
             )
-            fill_price = intent.current_price
+            fill_price = intent.limit_price if order_type == "Limit" else intent.current_price
             return ExecutionResult(
                 success=True,
                 status="filled",
