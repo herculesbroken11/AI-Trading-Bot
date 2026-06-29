@@ -57,6 +57,10 @@ def broker_status_is_filled(broker_status: Optional[str]) -> bool:
     return str(broker_status or "").strip().lower() == "filled"
 
 
+def broker_status_is_live(broker_status: Optional[str]) -> bool:
+    return str(broker_status or "").strip().lower() == "live"
+
+
 def resolve_execution_fill_price(
     *,
     broker_status: Optional[str],
@@ -139,12 +143,24 @@ def summarize_live_orders_response(response: Dict[str, Any]) -> List[Dict[str, A
     return summaries
 
 
-def format_live_orders_summary(orders: List[Dict[str, Any]]) -> str:
-    if not orders:
-        return "live_orders_count: 0"
-    lines = [f"live_orders_count: {len(orders)}", "--- live orders ---"]
+def partition_orders_for_cancel_list(
+    orders: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split endpoint orders into active Live orders vs non-live history."""
+    active_live: List[Dict[str, Any]] = []
+    order_history: List[Dict[str, Any]] = []
+    for order in orders:
+        if broker_status_is_live(order.get("broker_status")):
+            active_live.append(order)
+        else:
+            order_history.append(order)
+    return active_live, order_history
+
+
+def _format_order_lines(orders: List[Dict[str, Any]], *, prefix: str) -> List[str]:
+    lines: List[str] = []
     for index, order in enumerate(orders, start=1):
-        lines.append(f"order[{index}]:")
+        lines.append(f"{prefix}[{index}]:")
         for key in (
             "broker_order_id",
             "broker_status",
@@ -155,6 +171,22 @@ def format_live_orders_summary(orders: List[Dict[str, Any]]) -> str:
             "limit_price",
         ):
             lines.append(f"  {key}: {order.get(key)}")
+    return lines
+
+
+def format_live_orders_summary(orders: List[Dict[str, Any]]) -> str:
+    active_live, order_history = partition_orders_for_cancel_list(orders)
+    lines = [
+        f"endpoint_orders_count: {len(orders)}",
+        f"active_live_orders_count: {len(active_live)}",
+        "info: check positions_count with scripts/smoke_tastytrade_sandbox_read.py",
+    ]
+    if active_live:
+        lines.append("--- active live orders ---")
+        lines.extend(_format_order_lines(active_live, prefix="live_order"))
+    if order_history:
+        lines.append("--- order_history ---")
+        lines.extend(_format_order_lines(order_history, prefix="history_order"))
     return "\n".join(lines)
 
 

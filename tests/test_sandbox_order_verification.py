@@ -120,3 +120,45 @@ def test_verify_position_close_lag_warning():
     assert ok is False
     assert "warning" in message
     assert "lag" in message
+
+
+def _assert_no_misleading_live_orders_count_label(text: str) -> None:
+    for line in text.splitlines():
+        assert not line.startswith("live_orders_count:")
+
+
+def test_partition_orders_counts_only_live_as_active():
+    from backend.adapters.broker.sandbox_order_verification import (
+        format_live_orders_summary,
+        partition_orders_for_cancel_list,
+    )
+
+    orders = [
+        {"broker_order_id": "1", "broker_status": "Live", "symbol": "TNA"},
+        {"broker_order_id": "2", "broker_status": "Cancelled", "symbol": "TNA"},
+        {"broker_order_id": "3", "broker_status": "Rejected", "symbol": "TZA"},
+        {"broker_order_id": "4", "broker_status": "Filled", "symbol": "TNA"},
+    ]
+    active, history = partition_orders_for_cancel_list(orders)
+    assert len(active) == 1
+    assert active[0]["broker_order_id"] == "1"
+    assert len(history) == 3
+
+    text = format_live_orders_summary(orders)
+    assert "active_live_orders_count: 1" in text
+    assert "endpoint_orders_count: 4" in text
+    _assert_no_misleading_live_orders_count_label(text)
+    assert "--- active live orders ---" in text
+    assert "--- order_history ---" in text
+    assert "broker_status: Cancelled" in text
+    assert "broker_status: Rejected" in text
+
+
+def test_format_live_orders_summary_empty():
+    from backend.adapters.broker.sandbox_order_verification import format_live_orders_summary
+
+    text = format_live_orders_summary([])
+    assert "endpoint_orders_count: 0" in text
+    assert "active_live_orders_count: 0" in text
+    _assert_no_misleading_live_orders_count_label(text)
+    assert "positions_count" in text

@@ -338,7 +338,76 @@ def test_cancel_script_lists_without_confirm(monkeypatch, capsys):
     assert mod.main([]) == 0
     assert cancel_called["value"] is False
     out = capsys.readouterr().out
-    assert "live_orders_count: 1" in out
+    assert "active_live_orders_count: 1" in out
+    assert "--- active live orders ---" in out
+    for line in out.splitlines():
+        assert not line.startswith("live_orders_count:")
+
+
+def test_cancel_script_excludes_cancelled_from_active_live_count(monkeypatch, capsys):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CANCEL_SCRIPT, "smoke_cancel_history")
+    cancel_called = {"value": False}
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541"}
+
+        def get_positions(self, account_number):
+            return []
+
+        def list_live_orders(self, account_number):
+            return [
+                {
+                    "id": 1,
+                    "status": "Cancelled",
+                    "order-type": "Limit",
+                    "price": "2.00",
+                    "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+                },
+                {
+                    "id": 2,
+                    "status": "Rejected",
+                    "order-type": "Limit",
+                    "price": "2.00",
+                    "legs": [{"symbol": "TZA", "quantity": 1, "action": "Buy to Open"}],
+                },
+            ]
+
+        def cancel_order(self, account_number, order_id):
+            cancel_called["value"] = True
+            return {"data": {"cancelled": True}}
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main([]) == 0
+    out = capsys.readouterr().out
+    assert "endpoint_orders_count: 2" in out
+    assert "active_live_orders_count: 0" in out
+    assert "--- order_history ---" in out
+    assert "broker_status: Cancelled" in out
+    assert "broker_status: Rejected" in out
+    assert "--- active live orders ---" not in out
 
 
 def test_cancel_script_requires_confirm_to_cancel(monkeypatch):
