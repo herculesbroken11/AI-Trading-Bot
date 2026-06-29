@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 30.0
 CUSTOMERS_ME_ACCOUNTS_PATH = "/customers/me/accounts"
 EQUITY_BUY_ACTION = "Buy to Open"
+PRICE_EFFECT_DEBIT = "Debit"
 
 
 def _coerce_amount(value: Any) -> Optional[float]:
@@ -68,6 +69,7 @@ def build_equity_order_payload(
     payload: Dict[str, Any] = {
         "time-in-force": time_in_force,
         "order-type": normalized_type,
+        "price-effect": PRICE_EFFECT_DEBIT,
         "legs": [
             {
                 "instrument-type": "Equity",

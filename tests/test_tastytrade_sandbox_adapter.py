@@ -205,8 +205,10 @@ def test_dry_run_uses_dry_run_endpoint(mock_client_cls):
     assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders/dry-run"
     payload = mock_client.request.call_args.kwargs["json"]
     assert payload["order-type"] == "Market"
+    assert payload["price-effect"] == "Debit"
     assert payload["legs"][0]["action"] == "Buy to Open"
     assert "price" not in payload
+    assert "price_effect" not in payload
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
@@ -230,6 +232,9 @@ def test_submit_order_uses_submit_endpoint(mock_client_cls):
     assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders"
     payload = mock_client.request.call_args.kwargs["json"]
     assert payload["price"] == "2.00"
+    assert payload["price-effect"] == "Debit"
+    assert payload["legs"][0]["action"] == "Buy to Open"
+    assert "price_effect" not in payload
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
