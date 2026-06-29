@@ -26,6 +26,7 @@ from backend.risk.models import ExecutionResult, OrderIntent
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
+CUSTOMERS_ME_ACCOUNTS_PATH = "/customers/me/accounts"
 
 
 @dataclass
@@ -138,14 +139,14 @@ class TastytradeSandboxAdapter:
         return response.json().get("data", {})
 
     def get_accounts(self) -> List[Dict[str, Any]]:
+        """List sandbox accounts via GET /customers/me/accounts only (not GET /accounts)."""
         self._auth.ensure_authenticated()
-        response = self._request("GET", "/customers/me/accounts", step="get_accounts")
-        data = response.json()
-        items = data.get("data", {}).get("items", [])
-        if not items:
-            accounts_resp = self._request("GET", "/accounts", step="get_accounts")
-            items = accounts_resp.json().get("data", {}).get("items", [])
-        return items
+        response = self._request(
+            "GET",
+            CUSTOMERS_ME_ACCOUNTS_PATH,
+            step="get_accounts",
+        )
+        return response.json().get("data", {}).get("items", [])
 
     def _resolve_account_number(self, account_number: Optional[str] = None) -> str:
         if account_number:
@@ -160,7 +161,7 @@ class TastytradeSandboxAdapter:
                 step_diagnostics=StepFailureDiagnostics(
                     step="get_accounts",
                     status_code=404,
-                    endpoint_path="/customers/me/accounts",
+                    endpoint_path=CUSTOMERS_ME_ACCOUNTS_PATH,
                     authorization_present=True,
                     user_agent_present=True,
                     provider_message="No accounts returned",

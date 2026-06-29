@@ -75,8 +75,65 @@ def test_get_accounts_parses_response(mock_client_cls):
     accounts = adapter.get_accounts()
     assert len(accounts) == 1
     called_url = mock_client.request.call_args[0][1]
-    assert called_url.startswith(SANDBOX_BASE_URL)
-    assert "api.tastyworks.com" not in called_url or "cert.tastyworks" in called_url
+    assert called_url == f"{SANDBOX_BASE_URL}/customers/me/accounts"
+    assert mock_client.request.call_count == 1
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_get_accounts_empty_does_not_call_top_level_accounts(mock_client_cls):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"data": {"items": []}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = mock_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    accounts = adapter.get_accounts()
+    assert accounts == []
+    assert mock_client.request.call_count == 1
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/customers/me/accounts"
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_get_accounts_403_reports_customers_me_accounts_endpoint(mock_client_cls):
+    response = MagicMock()
+    response.status_code = 403
+    response.text = '{"error":{"message":"User not permitted access"}}'
+    response.json.return_value = {"error": {"message": "User not permitted access"}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    with pytest.raises(SandboxApiError) as exc:
+        adapter.get_accounts()
+
+    assert exc.value.step_diagnostics is not None
+    assert exc.value.step_diagnostics.endpoint_path == "/customers/me/accounts"
+    assert exc.value.step_diagnostics.step == "get_accounts"
+
+
+def test_get_accounts_does_not_use_top_level_accounts_listing():
+    import inspect
+
+    from backend.adapters.broker import tastytrade_sandbox as mod
+
+    source = inspect.getsource(mod.TastytradeSandboxAdapter.get_accounts)
+    assert "/customers/me/accounts" in source
+    assert '"/accounts"' not in source
+    assert "'/accounts'" not in source
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
