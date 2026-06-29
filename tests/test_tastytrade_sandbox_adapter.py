@@ -1,5 +1,6 @@
 """TastytradeSandboxAdapter unit tests (mocked httpx)."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -137,15 +138,24 @@ def test_get_accounts_does_not_use_top_level_accounts_listing():
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
-def test_submit_order_422_message(mock_client_cls):
+def test_submit_order_422_includes_redacted_response_json(mock_client_cls):
     accounts_response = MagicMock()
     accounts_response.status_code = 200
     accounts_response.json.return_value = {"data": {"items": [{"account-number": "5WT00001"}]}}
 
     order_response = MagicMock()
     order_response.status_code = 422
-    order_response.text = '{"error":{"message":"instrumentation lag"}}'
-    order_response.json.return_value = {"error": {"message": "instrumentation lag"}}
+    order_response.text = json.dumps(
+        {
+            "error": {
+                "code": "preflight_check_failure",
+                "message": "One or more preflight checks failed",
+            },
+            "errors": [{"code": "buying_power", "message": "Insufficient buying power"}],
+            "warnings": [{"code": "tif_next_valid_session", "message": "Next session"}],
+        }
+    )
+    order_response.json.return_value = json.loads(order_response.text)
 
     mock_client = MagicMock()
     mock_client.__enter__.return_value = mock_client
@@ -154,16 +164,72 @@ def test_submit_order_422_message(mock_client_cls):
 
     auth = MagicMock(spec=SandboxOAuthClient)
     auth.request_headers.return_value = {
-        "Authorization": "Bearer x",
+        "Authorization": "Bearer secret-access-token-xyz",
         "User-Agent": "AI-Trading-Bot/0.1",
     }
     adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
 
     with pytest.raises(SandboxApiError) as exc:
         adapter.submit_equity_order(None, "TNA", "buy", 1)
-    assert exc.value.status_code == 422
-    assert exc.value.step_diagnostics is not None
-    assert exc.value.step_diagnostics.step == "submit_order"
+
+    diag = exc.value.step_diagnostics
+    assert diag is not None
+    assert diag.step == "submit_order"
+    assert diag.endpoint_path == "/accounts/5WT00001/orders"
+    assert diag.provider_error_code == "preflight_check_failure"
+    assert diag.redacted_response_json is not None
+    safe = diag.format_safe()
+    assert "response_json:" in safe
+    assert "preflight_check_failure" in safe
+    assert "secret-access-token-xyz" not in safe
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_dry_run_uses_dry_run_endpoint(mock_client_cls):
+    dry_response = MagicMock()
+    dry_response.status_code = 200
+    dry_response.json.return_value = {"data": {"buying-power-effect": {}}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = dry_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    adapter.dry_run_equity_order("5WM30541", "TNA", "buy", 1)
+
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders/dry-run"
+    payload = mock_client.request.call_args.kwargs["json"]
+    assert payload["order-type"] == "Market"
+    assert payload["legs"][0]["action"] == "Buy to Open"
+    assert "price" not in payload
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_submit_order_uses_submit_endpoint(mock_client_cls):
+    submit_response = MagicMock()
+    submit_response.status_code = 200
+    submit_response.json.return_value = {"data": {"order": {"id": "123"}}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = submit_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    adapter.submit_equity_order("5WM30541", "TZA", "buy", 1, order_type="Limit", limit_price=2.0)
+
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders"
+    payload = mock_client.request.call_args.kwargs["json"]
+    assert payload["price"] == "2.00"
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")

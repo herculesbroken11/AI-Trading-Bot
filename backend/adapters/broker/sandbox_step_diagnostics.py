@@ -36,6 +36,11 @@ class StepFailureDiagnostics:
     authorization_present: bool
     user_agent_present: bool
     provider_message: Optional[str] = None
+    provider_error_code: Optional[str] = None
+    provider_errors: Optional[str] = None
+    provider_warnings: Optional[str] = None
+    preflight_checks: Optional[str] = None
+    redacted_response_json: Optional[str] = None
 
     def format_safe(self) -> str:
         lines = [
@@ -45,8 +50,18 @@ class StepFailureDiagnostics:
             f"Authorization header present: {str(self.authorization_present).lower()}",
             f"User-Agent header present: {str(self.user_agent_present).lower()}",
             f"provider_message: {self.provider_message or 'none'}",
-            f"next_step: {step_next_step_hint(self)}",
         ]
+        if self.provider_error_code:
+            lines.append(f"provider_error_code: {self.provider_error_code}")
+        if self.provider_errors:
+            lines.append(f"provider_errors: {self.provider_errors}")
+        if self.provider_warnings:
+            lines.append(f"provider_warnings: {self.provider_warnings}")
+        if self.preflight_checks:
+            lines.append(f"preflight_checks: {self.preflight_checks}")
+        if self.redacted_response_json:
+            lines.append(f"response_json: {self.redacted_response_json}")
+        lines.append(f"next_step: {step_next_step_hint(self)}")
         return "\n".join(lines)
 
 
@@ -100,6 +115,71 @@ def parse_provider_message(response_text: str) -> Optional[str]:
     return None
 
 
+def _redact_json_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return json.dumps(redact_dict(value), separators=(",", ":"))
+    if isinstance(value, list):
+        return json.dumps([redact_dict(x) if isinstance(x, dict) else x for x in value], separators=(",", ":"))
+    return str(value)
+
+
+def parse_full_provider_details(response_text: str) -> Dict[str, Optional[str]]:
+    """Parse redacted provider error fields from an API response body."""
+    empty: Dict[str, Optional[str]] = {
+        "provider_message": None,
+        "provider_error_code": None,
+        "provider_errors": None,
+        "provider_warnings": None,
+        "preflight_checks": None,
+        "redacted_response_json": None,
+    }
+    if not response_text or not response_text.strip():
+        return empty
+
+    try:
+        data = json.loads(response_text)
+    except Exception:
+        redacted = _TOKEN_LIKE_RE.sub("[REDACTED]", response_text[:500].strip())
+        empty["provider_message"] = redacted or None
+        return empty
+
+    if not isinstance(data, dict):
+        return empty
+
+    redacted = redact_dict(data)
+    empty["redacted_response_json"] = json.dumps(redacted, separators=(",", ":"))
+
+    error_val = redacted.get("error")
+    if isinstance(error_val, dict):
+        code = error_val.get("code")
+        if isinstance(code, str) and code.strip():
+            empty["provider_error_code"] = code.strip()
+        msg = error_val.get("message")
+        if isinstance(msg, str) and msg.strip():
+            empty["provider_message"] = _TOKEN_LIKE_RE.sub("[REDACTED]", msg.strip())
+    elif isinstance(error_val, str) and error_val.strip():
+        empty["provider_message"] = _TOKEN_LIKE_RE.sub("[REDACTED]", error_val.strip())
+
+    if not empty["provider_message"]:
+        for key in ("error_description", "message"):
+            val = redacted.get(key)
+            if isinstance(val, str) and val.strip():
+                empty["provider_message"] = _TOKEN_LIKE_RE.sub("[REDACTED]", val.strip())
+                break
+
+    for list_key, out_key in (
+        ("errors", "provider_errors"),
+        ("warnings", "provider_warnings"),
+        ("preflight-checks", "preflight_checks"),
+        ("preflight_checks", "preflight_checks"),
+    ):
+        items = redacted.get(list_key)
+        if items:
+            empty[out_key] = _redact_json_value(items)
+
+    return empty
+
+
 def build_step_failure(
     *,
     step: str,
@@ -109,13 +189,22 @@ def build_step_failure(
     response_text: str = "",
 ) -> StepFailureDiagnostics:
     auth_present, ua_present = header_flags(request_headers)
+    details = parse_full_provider_details(response_text)
+    message = details["provider_message"]
+    if not message:
+        message = parse_provider_message(response_text)
     return StepFailureDiagnostics(
         step=step,
         status_code=status_code,
         endpoint_path=endpoint_path,
         authorization_present=auth_present,
         user_agent_present=ua_present,
-        provider_message=parse_provider_message(response_text),
+        provider_message=message,
+        provider_error_code=details["provider_error_code"],
+        provider_errors=details["provider_errors"],
+        provider_warnings=details["provider_warnings"],
+        preflight_checks=details["preflight_checks"],
+        redacted_response_json=details["redacted_response_json"],
     )
 
 
@@ -134,6 +223,12 @@ def step_next_step_hint(diagnostics: StepFailureDiagnostics) -> str:
         )
 
     if status == 422:
+        if step in {"dry_run_order", "submit_order"}:
+            return (
+                "Next step: review preflight_checks/response_json; buying_power may be 0 on "
+                "new sandbox accounts; try --order-type Limit --limit-price 2.00 or symbol TZA; "
+                "sandbox instrumentation may lag."
+            )
         return "Next step: sandbox instrumentation may lag — retry later."
 
     if status == 429:

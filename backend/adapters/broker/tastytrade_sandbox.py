@@ -18,7 +18,6 @@ from backend.config.tastytrade_urls import (
     ALLOWED_SANDBOX_SYMBOLS,
     SANDBOX_BASE_URL,
     SANDBOX_MAX_ORDER_QUANTITY,
-    USER_AGENT,
     assert_sandbox_base_url,
 )
 from backend.risk.models import ExecutionResult, OrderIntent
@@ -27,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
 CUSTOMERS_ME_ACCOUNTS_PATH = "/customers/me/accounts"
+EQUITY_BUY_ACTION = "Buy to Open"
 
 
 @dataclass
@@ -40,6 +40,38 @@ class SandboxApiError(Exception):
         if self.step_diagnostics:
             return self.step_diagnostics.format_safe()
         return self.message
+
+
+def build_equity_order_payload(
+    *,
+    symbol: str,
+    quantity: int,
+    order_type: str = "Market",
+    time_in_force: str = "Day",
+    limit_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build Tastytrade equity order JSON with dashed keys (Market or Limit)."""
+    normalized_type = order_type.strip().capitalize()
+    if normalized_type not in {"Market", "Limit"}:
+        raise SandboxApiError(400, f"Unsupported order_type {order_type!r} in Phase 2 sandbox adapter")
+
+    payload: Dict[str, Any] = {
+        "time-in-force": time_in_force,
+        "order-type": normalized_type,
+        "legs": [
+            {
+                "instrument-type": "Equity",
+                "symbol": symbol.strip().upper(),
+                "quantity": quantity,
+                "action": EQUITY_BUY_ACTION,
+            }
+        ],
+    }
+    if normalized_type == "Limit":
+        if limit_price is None:
+            raise SandboxApiError(400, "Limit orders require limit_price")
+        payload["price"] = f"{float(limit_price):.2f}"
+    return payload
 
 
 class TastytradeSandboxAdapter:
@@ -109,7 +141,7 @@ class TastytradeSandboxAdapter:
         if response.status_code == 422:
             msg = (
                 f"Sandbox API returned 422 for {symbol or step}. "
-                "Valid symbols may lag in sandbox instrumentation — retry later."
+                "One or more preflight checks failed."
             )
         elif response.status_code == 429:
             msg = "Sandbox API rate limit (429). Retry after a short delay."
@@ -131,6 +163,59 @@ class TastytradeSandboxAdapter:
             body,
             step_diagnostics=step_diag,
         )
+
+    def _validate_equity_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        order_type: str,
+        limit_price: Optional[float],
+    ) -> tuple[str, str]:
+        symbol = symbol.strip().upper()
+        side = side.strip().lower()
+        order_type = order_type.strip().capitalize()
+        if symbol not in ALLOWED_SANDBOX_SYMBOLS:
+            raise SandboxApiError(400, f"Symbol {symbol!r} not allowed in Phase 2 sandbox adapter")
+        if side != "buy":
+            raise SandboxApiError(400, "Only buy orders are allowed in Phase 2 sandbox adapter")
+        if quantity <= 0 or quantity > SANDBOX_MAX_ORDER_QUANTITY:
+            raise SandboxApiError(
+                400,
+                f"Sandbox quantity must be 1..{SANDBOX_MAX_ORDER_QUANTITY}, got {quantity}",
+            )
+        if order_type == "Limit" and limit_price is None:
+            raise SandboxApiError(400, "Limit orders require limit_price")
+        return symbol, order_type
+
+    def _post_equity_order(
+        self,
+        account_number: Optional[str],
+        *,
+        symbol: str,
+        side: str,
+        quantity: int,
+        order_type: str,
+        time_in_force: str,
+        limit_price: Optional[float],
+        dry_run: bool,
+    ) -> Dict[str, Any]:
+        symbol, order_type = self._validate_equity_order(
+            symbol, side, quantity, order_type, limit_price
+        )
+        acct = self._resolve_account_number(account_number)
+        order_data = build_equity_order_payload(
+            symbol=symbol,
+            quantity=quantity,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+        )
+        suffix = "/dry-run" if dry_run else ""
+        step = "dry_run_order" if dry_run else "submit_order"
+        path = f"/accounts/{acct}/orders{suffix}"
+        response = self._request("POST", path, step=step, json=order_data)
+        return response.json()
 
     def get_customers_me(self) -> Dict[str, Any]:
         """Fetch authenticated sandbox customer profile (read smoke step)."""
@@ -194,6 +279,29 @@ class TastytradeSandboxAdapter:
         response = self._request("GET", path, step="get_positions")
         return response.json().get("data", {}).get("items", [])
 
+    def dry_run_equity_order(
+        self,
+        account_number: Optional[str],
+        symbol: str,
+        side: str,
+        quantity: int,
+        order_type: str = "Market",
+        time_in_force: str = "Day",
+        limit_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Preflight order via POST /accounts/{account}/orders/dry-run (no placement)."""
+        self._auth.ensure_authenticated()
+        return self._post_equity_order(
+            account_number,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+            dry_run=True,
+        )
+
     def submit_equity_order(
         self,
         account_number: Optional[str],
@@ -202,37 +310,20 @@ class TastytradeSandboxAdapter:
         quantity: int,
         order_type: str = "Market",
         time_in_force: str = "Day",
+        limit_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        symbol = symbol.strip().upper()
-        side = side.strip().lower()
-        if symbol not in ALLOWED_SANDBOX_SYMBOLS:
-            raise SandboxApiError(400, f"Symbol {symbol!r} not allowed in Phase 2 sandbox adapter")
-        if side != "buy":
-            raise SandboxApiError(400, "Only buy orders are allowed in Phase 2 sandbox adapter")
-        if quantity <= 0 or quantity > SANDBOX_MAX_ORDER_QUANTITY:
-            raise SandboxApiError(
-                400,
-                f"Sandbox quantity must be 1..{SANDBOX_MAX_ORDER_QUANTITY}, got {quantity}",
-            )
-
-        acct = self._resolve_account_number(account_number)
-        order_data = {
-            "time-in-force": time_in_force,
-            "order-type": order_type,
-            "price": None,
-            "price-effect": "Debit",
-            "legs": [
-                {
-                    "instrument-type": "Equity",
-                    "symbol": symbol,
-                    "quantity": quantity,
-                    "action": "Buy to Open",
-                }
-            ],
-        }
-        path = f"/accounts/{acct}/orders"
-        response = self._request("POST", path, step="submit_order", json=order_data)
-        return response.json()
+        """Submit order via POST /accounts/{account}/orders."""
+        self._auth.ensure_authenticated()
+        return self._post_equity_order(
+            account_number,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+            dry_run=False,
+        )
 
     def get_order(self, account_number: Optional[str], order_id: str) -> Dict[str, Any]:
         acct = self._resolve_account_number(account_number)
@@ -245,6 +336,7 @@ class TastytradeSandboxAdapter:
         symbol = intent.symbol.strip().upper()
         side = intent.side.strip().lower()
         mode = intent.trading_mode.strip().lower()
+        order_type = (intent.order_type or "Market").strip().capitalize()
 
         try:
             result = self.submit_equity_order(
@@ -252,7 +344,7 @@ class TastytradeSandboxAdapter:
                 symbol=symbol,
                 side=side,
                 quantity=intent.quantity,
-                order_type=intent.order_type or "Market",
+                order_type=order_type,
             )
             order_data = result.get("data", {}).get("order") or result.get("data", {})
             order_id = str(
