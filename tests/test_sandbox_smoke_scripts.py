@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 READ_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_read.py"
 ORDER_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_order.py"
 CLOSE_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_close.py"
+CANCEL_SCRIPT = REPO_ROOT / "scripts" / "smoke_tastytrade_sandbox_cancel.py"
 
 
 def _load_module(path: Path, name: str):
@@ -283,6 +284,214 @@ def test_read_script_does_not_submit_orders():
     assert "submit_equity_order" not in text
     assert "OrderExecutor" not in text
     assert "/orders" not in text
+
+
+def test_cancel_script_lists_without_confirm(monkeypatch, capsys):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CANCEL_SCRIPT, "smoke_cancel_list")
+    cancel_called = {"value": False}
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541"}
+
+        def get_positions(self, account_number):
+            return []
+
+        def list_live_orders(self, account_number):
+            return [
+                {
+                    "id": 115959,
+                    "status": "Live",
+                    "order-type": "Limit",
+                    "price": "2.00",
+                    "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+                }
+            ]
+
+        def cancel_order(self, account_number, order_id):
+            cancel_called["value"] = True
+            return {"data": {"cancelled": True}}
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main([]) == 0
+    assert cancel_called["value"] is False
+    out = capsys.readouterr().out
+    assert "live_orders_count: 1" in out
+
+
+def test_cancel_script_requires_confirm_to_cancel(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CANCEL_SCRIPT, "smoke_cancel_preview")
+    cancel_called = {"value": False}
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541"}
+
+        def get_positions(self, account_number):
+            return []
+
+        def list_live_orders(self, account_number):
+            return []
+
+        def get_order(self, account_number, order_id):
+            return {
+                "data": {
+                    "id": int(order_id),
+                    "status": "Live",
+                    "order-type": "Limit",
+                    "price": "2.00",
+                    "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+                }
+            }
+
+        def cancel_order(self, account_number, order_id):
+            cancel_called["value"] = True
+            return {"data": {"cancelled": True}}
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main(["--order-id", "115959"]) == 0
+    assert cancel_called["value"] is False
+
+
+def test_cancel_script_confirm_cancels(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "configured")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "configured")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CANCEL_SCRIPT, "smoke_cancel_confirm")
+    cancel_called = {"value": False}
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541"}
+
+        def get_positions(self, account_number):
+            return []
+
+        def list_live_orders(self, account_number):
+            return []
+
+        def cancel_order(self, account_number, order_id):
+            cancel_called["value"] = True
+            return {"data": {"cancelled": True}}
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    assert mod.main(["--order-id", "115959", "--confirm-sandbox-cancel"]) == 0
+    assert cancel_called["value"] is True
+
+
+def test_cancel_script_no_trade_exec_import():
+    text = CANCEL_SCRIPT.read_text(encoding="utf-8")
+    imports = [l for l in text.splitlines() if l.strip().startswith(("import ", "from "))]
+    joined = "\n".join(imports)
+    assert "trade_exec" not in joined
+    assert "OrderExecutor" not in joined
+    assert "submit_equity_order" not in joined
+
+
+def test_cancel_script_never_prints_secrets(monkeypatch, capsys):
+    monkeypatch.setenv("TRADING_MODE", "sandbox")
+    monkeypatch.setenv("TASTYTRADE_ENV", "sandbox")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TASTYTRADE_CLIENT_SECRET", "super-secret-client-secret")
+    monkeypatch.setenv("TASTYTRADE_REFRESH_TOKEN", "super-secret-refresh-token")
+    monkeypatch.setenv("TASTYTRADE_OAUTH_SCOPES", "read trade")
+    reset_settings_cache()
+
+    mod = _load_module(CANCEL_SCRIPT, "smoke_cancel_secrets")
+
+    class FakeAuth:
+        is_authenticated = True
+
+        def ensure_authenticated(self):
+            return None
+
+    class FakeAdapter:
+        _auth = FakeAuth()
+
+        def get_customers_me(self):
+            return {}
+
+        def get_accounts(self):
+            return [{"account-number": "5WM30541"}]
+
+        def get_balance(self):
+            return {"account_number": "5WM30541"}
+
+        def get_positions(self, account_number):
+            return []
+
+        def list_live_orders(self, account_number):
+            return []
+
+    monkeypatch.setattr(mod, "TastytradeSandboxAdapter", lambda settings: FakeAdapter())
+    mod.main([])
+    output = capsys.readouterr().out + capsys.readouterr().err
+    assert "super-secret-client-secret" not in output
+    assert "super-secret-refresh-token" not in output
+    assert "Bearer" not in output
 
 
 def test_close_script_requires_confirm_flag(monkeypatch, capsys):

@@ -45,6 +45,33 @@ def test_order_repository_lifecycle(db_session):
     assert len(recent) == 1
 
 
+def test_order_repository_cancel_status(db_session):
+    repo = OrderRepository(db_session)
+    repo.create_pending_order(
+        order_id="SANDBOX-115959",
+        mode="sandbox",
+        symbol="TNA",
+        side="buy",
+        quantity=1,
+        order_type="Limit",
+        limit_price=2.0,
+    )
+    repo.finalize_execution(
+        "SANDBOX-115959",
+        "SANDBOX-115959",
+        status="submitted",
+        limit_price=2.0,
+        broker_order_id="115959",
+    )
+    cancelled = repo.mark_order_cancelled(broker_order_id="115959")
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+
+    failed = repo.mark_cancel_failed(broker_order_id="115959", message="reject")
+    assert failed is not None
+    assert failed.status == "cancel_failed"
+
+
 def test_order_repository_finalize_execution_stores_sandbox_fields(db_session):
     repo = OrderRepository(db_session)
     repo.create_pending_order(

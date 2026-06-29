@@ -328,6 +328,114 @@ def test_dry_run_close_uses_dry_run_endpoint(mock_client_cls):
 
 
 @patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_list_live_orders_uses_live_endpoint(mock_client_cls):
+    live_response = MagicMock()
+    live_response.status_code = 200
+    live_response.json.return_value = {
+        "data": {
+            "items": [
+                {
+                    "id": 115959,
+                    "status": "Live",
+                    "order-type": "Limit",
+                    "price": "2.00",
+                    "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+                }
+            ]
+        }
+    }
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = live_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    items = adapter.list_live_orders("5WM30541")
+    assert len(items) == 1
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders/live"
+    assert "cert.tastyworks" in called_url
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_cancel_order_uses_delete_endpoint(mock_client_cls):
+    cancel_response = MagicMock()
+    cancel_response.status_code = 200
+    cancel_response.content = b'{"data":{"cancelled":true}}'
+    cancel_response.json.return_value = {"data": {"cancelled": True}}
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.return_value = cancel_response
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    result = adapter.cancel_order("5WM30541", "115959")
+    assert result["data"]["cancelled"] is True
+    assert mock_client.request.call_args[0][0] == "DELETE"
+    called_url = mock_client.request.call_args[0][1]
+    assert called_url == f"{SANDBOX_BASE_URL}/accounts/5WM30541/orders/115959"
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
+def test_execute_order_live_status_has_no_fill_price(mock_client_cls):
+    submit_response = MagicMock()
+    submit_response.status_code = 200
+    submit_response.json.return_value = {"data": {"order": {"id": "789", "status": "Live"}}}
+
+    status_response = MagicMock()
+    status_response.status_code = 200
+    status_response.json.return_value = {
+        "data": {
+            "id": 789,
+            "status": "Live",
+            "order-type": "Limit",
+            "price": "2.00",
+            "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+        }
+    }
+
+    accounts_response = MagicMock()
+    accounts_response.status_code = 200
+    accounts_response.json.return_value = {
+        "data": {"items": [{"account-number": "5WM30541"}]}
+    }
+
+    mock_client = MagicMock()
+    mock_client.__enter__.return_value = mock_client
+    mock_client.request.side_effect = [accounts_response, submit_response, status_response]
+    mock_client_cls.return_value = mock_client
+
+    auth = MagicMock(spec=SandboxOAuthClient)
+    auth.request_headers.return_value = {"Authorization": "Bearer x", "User-Agent": "AI-Trading-Bot/0.1"}
+    adapter = TastytradeSandboxAdapter(_settings(), auth=auth)
+
+    intent = OrderIntent(
+        symbol="TNA",
+        side="buy",
+        quantity=1,
+        trading_mode="sandbox",
+        order_type="Limit",
+        limit_price=2.0,
+        current_price=50.0,
+    )
+    result = adapter.execute_order(intent)
+
+    assert result.success is True
+    assert result.status == "submitted"
+    assert result.fill_price is None
+    assert result.raw["broker_status"] == "Live"
+    assert result.raw["limit_price"] == 2.0
+
+
+@patch("backend.adapters.broker.tastytrade_sandbox.httpx.Client")
 def test_execute_order_passes_limit_price(mock_client_cls):
     submit_response = MagicMock()
     submit_response.status_code = 200

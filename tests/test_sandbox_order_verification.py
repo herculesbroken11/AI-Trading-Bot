@@ -67,6 +67,36 @@ def test_format_order_status_summary_redacts_nothing_sensitive():
     assert "Bearer" not in text
 
 
+def test_summarize_live_order_does_not_set_fill_price_for_live_status():
+    response = {
+        "data": {
+            "id": 115959,
+            "status": "Live",
+            "order-type": "Limit",
+            "price": "2.00",
+            "legs": [{"symbol": "TNA", "quantity": 1, "action": "Buy to Open"}],
+        }
+    }
+    summary = summarize_order_response(response)
+    assert summary["broker_status"] == "Live"
+    assert summary["status"] == "submitted"
+    assert summary["limit_price"] == 2.0
+    assert summary["fill_price"] is None
+
+
+def test_live_broker_status_does_not_imply_position():
+    ok, message = verify_buy_position_present([], "TNA")
+    assert ok is False
+    assert "warning" in message
+
+
+def test_resolve_execution_fill_price_live_returns_none():
+    from backend.adapters.broker.sandbox_order_verification import resolve_execution_fill_price
+
+    assert resolve_execution_fill_price(broker_status="Live", broker_fill_price=2.0) is None
+    assert resolve_execution_fill_price(broker_status="Filled", broker_fill_price=2.0) == 2.0
+
+
 def test_map_broker_status_live_to_submitted():
     assert map_broker_status_to_record_status("Live") == "submitted"
 

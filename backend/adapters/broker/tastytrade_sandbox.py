@@ -10,7 +10,9 @@ import httpx
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError, SandboxOAuthClient
 from backend.adapters.broker.sandbox_order_verification import (
+    broker_status_is_filled,
     extract_broker_order_id,
+    resolve_execution_fill_price,
     summarize_order_response,
 )
 from backend.adapters.broker.sandbox_step_diagnostics import (
@@ -433,6 +435,29 @@ class TastytradeSandboxAdapter:
         response = self.get_order(account_number, order_id)
         return summarize_order_response(response)
 
+    def list_live_orders(self, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List live sandbox orders via GET /accounts/{account}/orders/live."""
+        self._auth.ensure_authenticated()
+        acct = self._resolve_account_number(account_number)
+        path = f"/accounts/{acct}/orders/live"
+        response = self._request("GET", path, step="list_live_orders")
+        payload = response.json().get("data", {})
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        return items if isinstance(items, list) else []
+
+    def cancel_order(self, account_number: Optional[str], order_id: str) -> Dict[str, Any]:
+        """Cancel sandbox order via DELETE /accounts/{account}/orders/{order_id}."""
+        self._auth.ensure_authenticated()
+        acct = self._resolve_account_number(account_number)
+        path = f"/accounts/{acct}/orders/{order_id}"
+        response = self._request("DELETE", path, step="cancel_order")
+        if response.content:
+            try:
+                return response.json()
+            except Exception:
+                return {"data": {"cancelled": True, "order_id": order_id}}
+        return {"data": {"cancelled": True, "order_id": order_id}}
+
     def dry_run_equity_close(
         self,
         account_number: Optional[str],
@@ -499,37 +524,49 @@ class TastytradeSandboxAdapter:
                 or result.get("data", {}).get("id")
                 or "UNKNOWN"
             )
-            fill_price = intent.limit_price if order_type == "Limit" else intent.current_price
             broker_status = None
-            record_status = "filled"
+            record_status = "submitted"
+            fill_price = None
+            limit_price = intent.limit_price if order_type == "Limit" else None
             if broker_order_id:
                 try:
                     status_summary = self.fetch_order_status_summary(None, broker_order_id)
                     broker_status = status_summary.get("broker_status")
                     record_status = status_summary.get("status") or record_status
-                    if status_summary.get("fill_price") is not None:
-                        fill_price = status_summary["fill_price"]
+                    limit_price = status_summary.get("limit_price") if limit_price is None else limit_price
+                    fill_price = resolve_execution_fill_price(
+                        broker_status=broker_status,
+                        broker_fill_price=status_summary.get("fill_price"),
+                    )
                 except SandboxApiError:
                     logger.warning("sandbox get_order status fetch failed for order %s", order_id)
+            if broker_status_is_filled(broker_status):
+                message = (
+                    "Sandbox order filled. Market orders in sandbox may fill at $1 — "
+                    "not representative of real market fills."
+                )
+            elif str(broker_status or "").lower() == "live":
+                message = "Sandbox order submitted and is live (unfilled)."
+            else:
+                message = "Sandbox order submitted."
             return ExecutionResult(
                 success=True,
-                status=record_status if record_status in {"filled", "submitted", "live"} else "filled",
+                status=record_status,
                 order_id=f"SANDBOX-{order_id}",
                 symbol=symbol,
                 side=side,
                 quantity=intent.quantity,
                 fill_price=fill_price,
                 trading_mode=mode,
-                message=(
-                    "Sandbox order submitted. Market orders in sandbox may fill at $1 — "
-                    "not representative of real market fills."
-                ),
+                message=message,
                 raw={
                     "route": "sandbox",
                     "placed": True,
                     "broker_order_id": broker_order_id,
                     "broker_status": broker_status,
                     "record_status": record_status,
+                    "limit_price": limit_price,
+                    "order_type": order_type,
                 },
             )
         except SandboxApiError as exc:

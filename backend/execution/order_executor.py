@@ -186,17 +186,19 @@ class OrderExecutor:
         if not self._orders:
             return
         try:
-            if result.status in {"filled", "submitted", "live"} and result.success and result.order_id:
+            if result.status in {"filled", "submitted"} and result.success and result.order_id:
                 broker_order_id = (result.raw or {}).get("broker_order_id")
                 record_status = (result.raw or {}).get("record_status") or result.status
                 if record_status == "live":
                     record_status = "submitted"
+                fill_price = result.fill_price if record_status == "filled" else None
+                limit_price = (result.raw or {}).get("limit_price", intent.limit_price)
                 self._orders.finalize_execution(
                     pending_order_id,
                     result.order_id,
                     status=record_status,
-                    fill_price=result.fill_price,
-                    limit_price=intent.limit_price,
+                    fill_price=fill_price,
+                    limit_price=limit_price,
                     broker_order_id=str(broker_order_id) if broker_order_id else None,
                     raw=result.raw,
                 )

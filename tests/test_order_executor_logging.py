@@ -89,6 +89,60 @@ def test_executor_logs_risk_rejection(db_session):
     assert orders[0].symbol == "TNA"
 
 
+def test_executor_logs_sandbox_submitted_without_fill_price(db_session):
+    from backend.risk.models import ExecutionResult
+
+    class FakeSandboxAdapter:
+        def execute_order(self, intent):
+            return ExecutionResult(
+                success=True,
+                status="submitted",
+                order_id="SANDBOX-115959",
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=intent.quantity,
+                fill_price=None,
+                trading_mode="sandbox",
+                message="live",
+                raw={
+                    "broker_order_id": "115959",
+                    "record_status": "submitted",
+                    "broker_status": "Live",
+                    "limit_price": 2.0,
+                    "route": "sandbox",
+                },
+            )
+
+    router = ExecutionRouter(sandbox_adapter=FakeSandboxAdapter())  # type: ignore[arg-type]
+    executor = OrderExecutor(
+        router=router,
+        order_repository=OrderRepository(db_session),
+        decision_repository=DecisionRepository(db_session),
+        error_repository=ErrorRepository(db_session),
+    )
+    intent = OrderIntent(
+        symbol="TNA",
+        side="buy",
+        quantity=1,
+        trading_mode="sandbox",
+        order_type="Limit",
+        limit_price=2.0,
+        current_price=50.0,
+        source="test",
+    )
+    from tests.execution_helpers import make_context
+
+    result = executor.execute(intent, make_context(trading_mode="sandbox"))
+    assert result.success is True
+    assert result.fill_price is None
+
+    record = OrderRepository(db_session).get_by_order_id("SANDBOX-115959")
+    assert record is not None
+    assert record.status == "submitted"
+    assert record.fill_price is None
+    assert record.limit_price == 2.0
+
+
 def test_executor_logs_sandbox_fill_with_limit_price(db_session, monkeypatch):
     from backend.adapters.broker.tastytrade_sandbox import TastytradeSandboxAdapter
     from backend.risk.models import ExecutionResult

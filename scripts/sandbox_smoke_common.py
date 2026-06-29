@@ -131,6 +131,32 @@ def verify_position_after_close(
     print(message, file=stream)
 
 
+def print_execution_summary(
+    result,
+    *,
+    limit_price: Optional[float] = None,
+    order_type: Optional[str] = None,
+) -> None:
+    raw = result.raw or {}
+    broker_status = raw.get("broker_status")
+    resolved_limit = raw.get("limit_price", limit_price)
+    print(f"status: {result.status}")
+    print(f"success: {result.success}")
+    print(f"order_id: {result.order_id}")
+    print(f"broker_status: {broker_status}")
+    print(f"symbol: {result.symbol}")
+    print(f"side: {result.side}")
+    print(f"quantity: {result.quantity}")
+    print(f"order_type: {order_type or raw.get('order_type')}")
+    print(f"limit_price: {resolved_limit}")
+    if broker_status and str(broker_status).lower() == "live":
+        print("fill_price: None")
+    else:
+        print(f"fill_price: {result.fill_price}")
+    print(f"trading_mode: {result.trading_mode}")
+    print(f"message: {result.message}")
+
+
 def print_db_order_summary(repo: OrderRepository, order_id: str) -> None:
     record = repo.get_by_order_id(order_id)
     if not record:

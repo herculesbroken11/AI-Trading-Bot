@@ -26,6 +26,7 @@ from scripts.sandbox_smoke_common import (
     print_auth_error,
     print_db_order_summary,
     print_env_check,
+    print_execution_summary,
     validate_sandbox_env,
     verify_order_after_submit,
     verify_position_after_buy,
@@ -205,15 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     executor, order_repo = _build_executor(settings, adapter, with_db)
     result = executor.execute(intent, context)
 
-    print(f"status: {result.status}")
-    print(f"success: {result.success}")
-    print(f"order_id: {result.order_id}")
-    print(f"symbol: {result.symbol}")
-    print(f"side: {result.side}")
-    print(f"quantity: {result.quantity}")
-    print(f"fill_price: {result.fill_price}")
-    print(f"trading_mode: {result.trading_mode}")
-    print(f"message: {result.message}")
+    print_execution_summary(result, limit_price=args.limit_price, order_type=order_type)
 
     if not result.success:
         return 1

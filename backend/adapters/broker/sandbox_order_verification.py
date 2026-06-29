@@ -42,7 +42,7 @@ def broker_order_id_from_execution(order_id: Optional[str], raw: Optional[Dict[s
 
 def map_broker_status_to_record_status(broker_status: Optional[str]) -> str:
     if not broker_status:
-        return "filled"
+        return "submitted"
     normalized = broker_status.strip().lower()
     if normalized in {"filled", "cancelled", "canceled", "rejected", "expired", "live", "contingent"}:
         if normalized in {"canceled"}:
@@ -53,28 +53,46 @@ def map_broker_status_to_record_status(broker_status: Optional[str]) -> str:
     return "submitted"
 
 
+def broker_status_is_filled(broker_status: Optional[str]) -> bool:
+    return str(broker_status or "").strip().lower() == "filled"
+
+
+def resolve_execution_fill_price(
+    *,
+    broker_status: Optional[str],
+    broker_fill_price: Optional[float],
+) -> Optional[float]:
+    """Return fill_price only when broker confirms a fill."""
+    if not broker_status_is_filled(broker_status):
+        return None
+    return broker_fill_price
+
+
 def summarize_order_response(response: Dict[str, Any]) -> Dict[str, Any]:
     """Extract safe, loggable order fields from a Tastytrade get_order/submit response."""
     order = extract_order_data(response)
     legs = order.get("legs") or []
     leg = legs[0] if legs else {}
     broker_status = order.get("status") or order.get("order-status")
+    broker_status_str = str(broker_status) if broker_status is not None else None
+    limit_price = _coerce_float(order.get("price"))
+    fill_price = None
+    if broker_status_is_filled(broker_status_str):
+        fill_price = _coerce_float(
+            order.get("fill-price")
+            or order.get("average-fill-price")
+            or order.get("average_fill_price")
+        )
     return {
         "broker_order_id": extract_broker_order_id(response),
-        "status": map_broker_status_to_record_status(
-            str(broker_status) if broker_status is not None else None
-        ),
-        "broker_status": str(broker_status) if broker_status is not None else None,
+        "status": map_broker_status_to_record_status(broker_status_str),
+        "broker_status": broker_status_str,
         "symbol": (leg.get("symbol") or order.get("symbol") or "").upper(),
         "side": _infer_side_from_action(leg.get("action")),
         "quantity": leg.get("quantity") or order.get("quantity"),
         "order_type": order.get("order-type") or order.get("order_type"),
-        "limit_price": _coerce_float(order.get("price")),
-        "fill_price": _coerce_float(
-            order.get("fill-price")
-            or order.get("average-fill-price")
-            or order.get("average_fill_price")
-        ),
+        "limit_price": limit_price,
+        "fill_price": fill_price,
         "trading_mode": "sandbox",
     }
 
@@ -102,7 +120,41 @@ def format_order_status_summary(summary: Dict[str, Any]) -> str:
         "fill_price",
         "trading_mode",
     ):
-        lines.append(f"{key}: {summary.get(key)}")
+        value = summary.get(key)
+        if key == "fill_price" and summary.get("broker_status", "").lower() == "live":
+            value = None
+        lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def summarize_live_orders_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = response.get("data") or {}
+    items = data.get("items") if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        items = []
+    summaries: List[Dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            summaries.append(summarize_order_response({"data": item}))
+    return summaries
+
+
+def format_live_orders_summary(orders: List[Dict[str, Any]]) -> str:
+    if not orders:
+        return "live_orders_count: 0"
+    lines = [f"live_orders_count: {len(orders)}", "--- live orders ---"]
+    for index, order in enumerate(orders, start=1):
+        lines.append(f"order[{index}]:")
+        for key in (
+            "broker_order_id",
+            "broker_status",
+            "symbol",
+            "side",
+            "quantity",
+            "order_type",
+            "limit_price",
+        ):
+            lines.append(f"  {key}: {order.get(key)}")
     return "\n".join(lines)
 
 
