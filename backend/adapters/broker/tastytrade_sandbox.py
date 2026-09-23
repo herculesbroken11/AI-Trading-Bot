@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError, SandboxOAuthClient
+from backend.adapters.broker.sandbox_http_retry import (
+    is_transient_transport_error,
+    should_retry_http_status,
+)
 from backend.adapters.broker.sandbox_order_verification import (
     broker_status_is_filled,
     extract_broker_order_id,
@@ -160,20 +165,63 @@ class TastytradeSandboxAdapter:
         url = f"{SANDBOX_BASE_URL}{path}"
         assert_sandbox_base_url(SANDBOX_BASE_URL)
         headers = self._auth.request_headers()
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-            response = client.request(method, url, headers=headers, json=json)
-            if response.status_code == 401:
-                self._auth.refresh_access_token()
-                headers = self._auth.request_headers()
-                response = client.request(method, url, headers=headers, json=json)
-            if response.status_code >= 400:
-                raise self._parse_error(
-                    response,
-                    step=step,
-                    path=path,
-                    request_headers=headers,
-                )
-            return response
+        max_attempts = 3
+        backoff = (0.25, 0.5, 1.0)
+        last_response: Optional[httpx.Response] = None
+
+        for attempt in range(max_attempts):
+            try:
+                with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+                    response = client.request(method, url, headers=headers, json=json)
+                    if response.status_code == 401 and attempt == 0:
+                        self._auth.refresh_access_token()
+                        headers = self._auth.request_headers()
+                        response = client.request(method, url, headers=headers, json=json)
+                    last_response = response
+                    if response.status_code < 400:
+                        return response
+                    if should_retry_http_status(response.status_code) and attempt < max_attempts - 1:
+                        time.sleep(backoff[min(attempt, len(backoff) - 1)])
+                        continue
+                    raise self._parse_error(
+                        response,
+                        step=step,
+                        path=path,
+                        request_headers=headers,
+                    )
+            except SandboxApiError:
+                raise
+            except Exception as exc:
+                if is_transient_transport_error(exc) and attempt < max_attempts - 1:
+                    time.sleep(backoff[min(attempt, len(backoff) - 1)])
+                    continue
+                if last_response is not None and last_response.status_code >= 400:
+                    raise self._parse_error(
+                        last_response,
+                        step=step,
+                        path=path,
+                        request_headers=headers,
+                    )
+                raise SandboxApiError(
+                    503,
+                    f"Sandbox API transport error for step {step}: {type(exc).__name__}",
+                    step_diagnostics=StepFailureDiagnostics(
+                        step=step,
+                        status_code=503,
+                        endpoint_path=path,
+                        authorization_present=True,
+                        user_agent_present=True,
+                        provider_message=type(exc).__name__,
+                    ),
+                ) from exc
+
+        assert last_response is not None
+        raise self._parse_error(
+            last_response,
+            step=step,
+            path=path,
+            request_headers=headers,
+        )
 
     def _parse_error(
         self,

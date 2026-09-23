@@ -205,14 +205,53 @@ class SandboxBotWorker:
 
         warnings: List[str] = []
 
+        # --- OAuth / account / live-order preflight (before dry-run or submit) ---
         try:
             self._adapter._auth.ensure_authenticated()
+        except SandboxAuthError as exc:
+            message = str(exc)
+            self._log_error("sandbox_worker.oauth_preflight", exc, warnings)
+            result = SandboxBotCycleResult(
+                success=True,
+                decision_status="skipped_oauth_unhealthy",
+                signal=normalized_signal,
+                message=message,
+                warnings=warnings,
+                order_type=normalized_order_type,
+                limit_price=limit_price,
+            )
+            self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
+            return result
+
+        try:
             self._adapter.get_customers_me()
             accounts = self._adapter.get_accounts()
             if not accounts:
-                raise SandboxApiError(404, "No sandbox accounts returned")
+                result = SandboxBotCycleResult(
+                    success=True,
+                    decision_status="skipped_account_unavailable",
+                    signal=normalized_signal,
+                    message="No sandbox accounts returned",
+                    warnings=warnings,
+                    order_type=normalized_order_type,
+                    limit_price=limit_price,
+                )
+                self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
+                return result
             balance = self._adapter.get_balance()
             account_number = balance.get("account_number")
+            if not account_number:
+                result = SandboxBotCycleResult(
+                    success=True,
+                    decision_status="skipped_account_unavailable",
+                    signal=normalized_signal,
+                    message="Sandbox account number unavailable",
+                    warnings=warnings,
+                    order_type=normalized_order_type,
+                    limit_price=limit_price,
+                )
+                self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
+                return result
             positions = self._adapter.get_positions(account_number)
             positions_count = count_open_positions(positions)
 
@@ -220,7 +259,36 @@ class SandboxBotWorker:
             live_summaries = summarize_live_orders_response({"data": {"items": live_items}})
             active_live, _history = partition_orders_for_cancel_list(live_summaries)
             active_live_count = len(active_live)
+        except SandboxAuthError as exc:
+            message = str(exc)
+            self._log_error("sandbox_worker.oauth_preflight", exc, warnings)
+            result = SandboxBotCycleResult(
+                success=True,
+                decision_status="skipped_oauth_unhealthy",
+                signal=normalized_signal,
+                message=message,
+                warnings=warnings,
+                order_type=normalized_order_type,
+                limit_price=limit_price,
+            )
+            self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
+            return result
+        except SandboxApiError as exc:
+            message = str(exc)
+            self._log_error("sandbox_worker.account_preflight", exc, warnings)
+            result = SandboxBotCycleResult(
+                success=True,
+                decision_status="skipped_account_unavailable",
+                signal=normalized_signal,
+                message=message,
+                warnings=warnings,
+                order_type=normalized_order_type,
+                limit_price=limit_price,
+            )
+            self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
+            return result
 
+        try:
             self._log_account_snapshot(balance, positions, positions_count, warnings)
 
             skip = self._check_duplicate_protection(
@@ -486,7 +554,7 @@ class SandboxBotWorker:
         if active_live_count > 0:
             return SandboxBotCycleResult(
                 success=True,
-                decision_status="skipped_live_order_exists",
+                decision_status="skipped_active_live_order_exists",
                 signal="",
                 message="Active live sandbox order exists; skipping new trade",
             )

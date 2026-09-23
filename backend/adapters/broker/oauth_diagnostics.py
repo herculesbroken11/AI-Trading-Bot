@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from backend.utils.redact import redact_dict
 
@@ -26,12 +26,14 @@ class OAuthFailureDiagnostics:
     client_secret_configured: bool
     refresh_token_configured: bool
     redirect_uri_configured: bool
+    failure_reason: str = "unknown_provider_error"
 
     def format_safe(self) -> str:
         lines = [
             f"status_code: {self.status_code}",
             f"endpoint: {self.endpoint_path}",
             f"grant_type: {self.grant_type}",
+            f"failure_reason: {self.failure_reason}",
             f"error_code: {self.error_code or 'unknown'}",
             f"error_description: {self.error_description or 'none'}",
             f"client_id configured: {str(self.client_id_configured).lower()}",
@@ -40,6 +42,13 @@ class OAuthFailureDiagnostics:
             f"redirect_uri configured: {str(self.redirect_uri_configured).lower()}",
         ]
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class OAuthFailureClassification:
+    reason: str
+    message: str
+    next_step: str
 
 
 def redact_oauth_body(body: Any) -> Any:
@@ -81,6 +90,9 @@ def parse_oauth_error_body(response_text: str) -> tuple[Optional[str], Optional[
     else:
         error_code = None
 
+    if not error_code and isinstance(redacted.get("error_code"), str):
+        error_code = redacted["error_code"].strip() or None
+
     description = redacted.get("error_description") or redacted.get("message")
     if isinstance(description, str):
         description = _TOKEN_LIKE_RE.sub("[REDACTED]", description.strip()) or None
@@ -95,6 +107,97 @@ def parse_oauth_error_body(response_text: str) -> tuple[Optional[str], Optional[
     return error_code, description
 
 
+def classify_oauth_failure(
+    *,
+    status_code: int,
+    error_code: Optional[str],
+    error_description: Optional[str],
+) -> OAuthFailureClassification:
+    """Map provider OAuth failure into a clear, secret-free reason."""
+    code = (error_code or "").lower()
+    desc = (error_description or "").lower()
+
+    if status_code in {502, 503, 504} or status_code >= 500:
+        return OAuthFailureClassification(
+            reason="provider_unavailable",
+            message="Sandbox OAuth provider is temporarily unavailable.",
+            next_step="Next step: retry later; do not regenerate credentials for 5xx errors.",
+        )
+    if status_code == 400 and "not a tastytrade customer" in desc:
+        return OAuthFailureClassification(
+            reason="wrong_sandbox_customer",
+            message="Refresh token/grant does not map to a valid sandbox customer.",
+            next_step=(
+                "Next step: create a new grant on the sandbox OAuth app "
+                "(developer.tastytrade.com/sandbox), update TASTYTRADE_REFRESH_TOKEN only."
+            ),
+        )
+    if status_code == 400 and ("revoked" in desc or "expired" in desc):
+        return OAuthFailureClassification(
+            reason="invalid_refresh_token",
+            message="Sandbox refresh token was revoked or expired.",
+            next_step=(
+                "Next step: Create Grant on sandbox OAuth app and update "
+                "TASTYTRADE_REFRESH_TOKEN (do not regenerate secret unless lost)."
+            ),
+        )
+    if status_code == 400 and code == "invalid_client":
+        return OAuthFailureClassification(
+            reason="secret_token_mismatch",
+            message="Client secret does not match the sandbox OAuth app.",
+            next_step=(
+                "Next step: verify TASTYTRADE_CLIENT_SECRET is from the sandbox app "
+                "(not production my.tastytrade.com)."
+            ),
+        )
+    if status_code == 400 and code in {"invalid_grant", "invalid_request"}:
+        return OAuthFailureClassification(
+            reason="invalid_refresh_token",
+            message="Sandbox refresh token is invalid or out of sync with client secret.",
+            next_step=(
+                "Next step: Create Grant after confirming sandbox client secret; "
+                "update TASTYTRADE_REFRESH_TOKEN. Check for duplicate TASTYTRADE_ keys in .env."
+            ),
+        )
+    if status_code == 400 and ("production" in desc or "wrong environment" in desc):
+        return OAuthFailureClassification(
+            reason="production_sandbox_mismatch",
+            message="Credentials appear to target the wrong Tastytrade environment.",
+            next_step=(
+                "Next step: use sandbox Client ID/secret/grant only "
+                "(developer.tastytrade.com/sandbox) with api.cert.tastyworks.com."
+            ),
+        )
+    if status_code == 400:
+        return OAuthFailureClassification(
+            reason="wrong_app_or_grant_order",
+            message="Sandbox OAuth request rejected (likely secret/grant mismatch).",
+            next_step=(
+                "Next step: confirm Client ID, secret, and grant are all from the same "
+                "sandbox OAuth app; recreate grant after any secret regenerate."
+            ),
+        )
+    if status_code == 401:
+        return OAuthFailureClassification(
+            reason="invalid_refresh_token",
+            message="Sandbox OAuth unauthorized.",
+            next_step=(
+                "Next step: verify User-Agent and sandbox credentials; recreate grant if needed."
+            ),
+        )
+    if status_code == 403:
+        return OAuthFailureClassification(
+            reason="wrong_app_or_grant_order",
+            message="Sandbox OAuth forbidden — scopes or grant may be insufficient.",
+            next_step="Next step: ensure grant scopes include read trade openid.",
+        )
+    return OAuthFailureClassification(
+        reason="unknown_provider_error",
+        message=f"Sandbox OAuth failed with status {status_code}.",
+        next_step="Next step: run scripts/check_tastytrade_oauth.py and review diagnostics.",
+    )
+
+
 def build_oauth_diagnostics(
     *,
     status_code: int,
@@ -107,6 +210,11 @@ def build_oauth_diagnostics(
     endpoint_path: str = OAUTH_TOKEN_PATH,
 ) -> OAuthFailureDiagnostics:
     error_code, error_description = parse_oauth_error_body(response_text)
+    classification = classify_oauth_failure(
+        status_code=status_code,
+        error_code=error_code,
+        error_description=error_description,
+    )
     return OAuthFailureDiagnostics(
         status_code=status_code,
         endpoint_path=endpoint_path,
@@ -117,45 +225,15 @@ def build_oauth_diagnostics(
         client_secret_configured=client_secret_configured,
         refresh_token_configured=refresh_token_configured,
         redirect_uri_configured=redirect_uri_configured,
+        failure_reason=classification.reason,
     )
 
 
 def oauth_next_step_hint(diagnostics: OAuthFailureDiagnostics) -> str:
     """Human-readable next step — no secrets."""
-    code = (diagnostics.error_code or "").lower()
-    status = diagnostics.status_code
-
-    if status == 400 and code in {"invalid_grant", "invalid_request"}:
-        return (
-            "Next step: regenerate sandbox refresh token (OAuth Applications > Manage > "
-            "Create Grant). Sandbox resets every 24h — old tokens may be invalid."
-        )
-    desc = (diagnostics.error_description or "").lower()
-    if status == 400 and "revoked" in desc:
-        return (
-            "Next step: refresh token was revoked or sandbox reset. Create a new Personal "
-            "OAuth Grant in developer.tastyworks.com sandbox and update TASTYTRADE_REFRESH_TOKEN."
-        )
-    if status == 400 and code == "invalid_client":
-        return (
-            "Next step: verify TASTYTRADE_CLIENT_SECRET matches the sandbox OAuth app "
-            "at developer.tastyworks.com (not production credentials)."
-        )
-    if status == 400:
-        return (
-            "Next step: confirm client_secret and refresh_token are from the same sandbox "
-            "OAuth app; check TASTYTRADE_OAUTH_SCOPES matches app scopes."
-        )
-    if status == 401:
-        return (
-            "Next step: verify User-Agent header (AI-Trading-Bot/0.1) and that credentials "
-            "are for sandbox (TASTYTRADE_ENV=sandbox)."
-        )
-    if status == 403:
-        return (
-            "Next step: verify OAuth app scopes include read/trade; regenerate grant with "
-            "required scopes in TASTYTRADE_OAUTH_SCOPES."
-        )
-    if status == 422:
-        return "Next step: sandbox instrumentation may lag — retry later."
-    return "Next step: run scripts/check_tastytrade_sandbox_env.py and review diagnostics."
+    classification = classify_oauth_failure(
+        status_code=diagnostics.status_code,
+        error_code=diagnostics.error_code,
+        error_description=diagnostics.error_description,
+    )
+    return classification.next_step

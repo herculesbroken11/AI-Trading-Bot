@@ -12,12 +12,14 @@ from backend.adapters.broker.oauth_diagnostics import (
     REFRESH_GRANT_TYPE,
     OAuthFailureDiagnostics,
     build_oauth_diagnostics,
+    classify_oauth_failure,
     redact_oauth_body,
 )
 from backend.adapters.broker.sandbox_step_diagnostics import (
     StepFailureDiagnostics,
     build_step_failure,
 )
+from backend.adapters.broker.sandbox_token_store import persist_sandbox_refresh_token
 from backend.config.settings import Settings
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, USER_AGENT, assert_sandbox_base_url
 
@@ -194,19 +196,41 @@ class SandboxOAuthClient:
                 refresh_token_configured=flags["refresh_token_configured"],
                 redirect_uri_configured=flags["redirect_uri_configured"],
             )
+            classification = classify_oauth_failure(
+                status_code=diagnostics.status_code,
+                error_code=diagnostics.error_code,
+                error_description=diagnostics.error_description,
+            )
             logger.debug(
                 "Sandbox OAuth failed\n%s",
                 step_diag.format_safe(),
             )
             raise SandboxAuthError(
-                f"Sandbox OAuth failed ({response.status_code}).",
+                (
+                    f"Sandbox OAuth failed ({response.status_code}): "
+                    f"{classification.reason} — {classification.message} "
+                    f"{classification.next_step}"
+                ),
                 diagnostics=diagnostics,
                 step_diagnostics=step_diag,
             )
 
         data = self._parse_token_response(response)
         self._access_token = data.get("access_token")
-        self._refresh_token = data.get("refresh_token", refresh)
+        previous_refresh = refresh
+        next_refresh = data.get("refresh_token") or refresh
+        if isinstance(next_refresh, str):
+            next_refresh = next_refresh.strip() or refresh
+        self._refresh_token = next_refresh
+        if (
+            isinstance(next_refresh, str)
+            and next_refresh
+            and next_refresh != previous_refresh
+        ):
+            persist_sandbox_refresh_token(
+                next_refresh,
+                previous_refresh_token=previous_refresh,
+            )
         if not self._access_token:
             raise SandboxAuthError("Token response missing access_token")
 

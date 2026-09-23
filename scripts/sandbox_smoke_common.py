@@ -54,8 +54,13 @@ def print_api_error(exc: SandboxApiError) -> None:
 
 
 def print_auth_error(exc: SandboxAuthError) -> None:
+    from backend.adapters.broker.oauth_diagnostics import oauth_next_step_hint
+
     print("error: authentication failed", file=sys.stderr)
-    if exc.step_diagnostics:
+    if exc.diagnostics:
+        print(exc.diagnostics.format_safe(), file=sys.stderr)
+        print(oauth_next_step_hint(exc.diagnostics), file=sys.stderr)
+    elif exc.step_diagnostics:
         print(exc.step_diagnostics.format_safe(), file=sys.stderr)
     else:
         print(str(exc), file=sys.stderr)

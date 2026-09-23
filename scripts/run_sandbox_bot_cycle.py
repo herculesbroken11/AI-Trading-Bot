@@ -70,8 +70,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if result.decision_status in {
         "skipped_no_signal",
-        "skipped_live_order_exists",
+        "skipped_active_live_order_exists",
         "skipped_position_exists",
+        "skipped_oauth_unhealthy",
+        "skipped_account_unavailable",
         "dry_run_passed",
         "submitted",
     }:

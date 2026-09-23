@@ -12,10 +12,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.adapters.broker.oauth_diagnostics import oauth_next_step_hint
 from backend.adapters.broker.sandbox_auth import SandboxAuthError
 from backend.adapters.broker.sandbox_order_verification import (
     format_live_orders_summary,
     format_order_status_summary,
+    partition_orders_for_cancel_list,
     summarize_live_orders_response,
     summarize_order_response,
 )
@@ -23,7 +25,6 @@ from backend.adapters.broker.tastytrade_sandbox import SandboxApiError, Tastytra
 from backend.config.settings import ConfigurationError
 from backend.repositories.order_repository import OrderRepository
 from scripts.sandbox_smoke_common import (
-    fetch_account_state,
     print_api_error,
     print_auth_error,
     print_db_order_summary,
@@ -44,22 +45,6 @@ def _build_order_repo(settings, with_db: bool) -> Optional[OrderRepository]:
 
     configure_engine(settings.database_url, sql_echo=settings.sql_echo)
     return OrderRepository(get_db_session())
-
-
-def _preview_cancel(adapter: TastytradeSandboxAdapter, account_number: str, order_id: str) -> int:
-    print(f"cancel_preview: order_id={order_id}")
-    try:
-        response = adapter.get_order(account_number, order_id)
-        summary = summarize_order_response(response)
-        print(format_order_status_summary(summary))
-        print("info: re-run with --confirm-sandbox-cancel to cancel this order", file=sys.stderr)
-        return 0
-    except (SandboxApiError, SandboxAuthError) as exc:
-        if isinstance(exc, SandboxApiError):
-            print_api_error(exc)
-        else:
-            print_auth_error(exc)
-        return 1
 
 
 def _update_db_cancel_status(
@@ -84,6 +69,108 @@ def _update_db_cancel_status(
         print_db_order_summary(repo, record.order_id)
 
 
+def _oauth_and_account_preflight(adapter: TastytradeSandboxAdapter) -> tuple[Optional[str], int]:
+    """Validate OAuth and account before any cancel attempt. Returns (account, exit_code)."""
+    try:
+        adapter._auth.ensure_authenticated()
+    except SandboxAuthError as exc:
+        print_auth_error(exc)
+        print(
+            "error: OAuth validation failed — cancel aborted before any cancel attempt",
+            file=sys.stderr,
+        )
+        if exc.diagnostics:
+            print(oauth_next_step_hint(exc.diagnostics), file=sys.stderr)
+        else:
+            print(
+                "Next step: run scripts/check_tastytrade_oauth.py and fix credentials.",
+                file=sys.stderr,
+            )
+        return None, 1
+
+    try:
+        adapter.get_customers_me()
+        accounts = adapter.get_accounts()
+        if not accounts:
+            print("error: no sandbox accounts returned — cancel aborted", file=sys.stderr)
+            print(
+                "Next step: confirm sandbox customer/account exists for this OAuth grant.",
+                file=sys.stderr,
+            )
+            return None, 1
+        balance = adapter.get_balance()
+        account_number = balance.get("account_number")
+        if not account_number:
+            print("error: account number missing from balance — cancel aborted", file=sys.stderr)
+            return None, 1
+        return str(account_number), 0
+    except SandboxAuthError as exc:
+        print_auth_error(exc)
+        print("error: OAuth failed during account read — cancel aborted", file=sys.stderr)
+        if exc.diagnostics:
+            print(oauth_next_step_hint(exc.diagnostics), file=sys.stderr)
+        return None, 1
+    except SandboxApiError as exc:
+        print_api_error(exc)
+        print("error: account read failed — cancel aborted", file=sys.stderr)
+        print(
+            "Next step: run scripts/check_tastytrade_oauth.py then retry list/cancel.",
+            file=sys.stderr,
+        )
+        return None, 1
+
+
+def _list_orders(adapter: TastytradeSandboxAdapter, account_number: str) -> tuple[list, int]:
+    try:
+        live_items = adapter.list_live_orders(account_number)
+        summaries = summarize_live_orders_response({"data": {"items": live_items}})
+        print(format_live_orders_summary(summaries))
+        return summaries, 0
+    except (SandboxApiError, SandboxAuthError) as exc:
+        if isinstance(exc, SandboxApiError):
+            print_api_error(exc)
+        else:
+            print_auth_error(exc)
+        return [], 1
+
+
+def _preview_cancel(adapter: TastytradeSandboxAdapter, account_number: str, order_id: str) -> int:
+    print(f"cancel_preview: order_id={order_id}")
+    try:
+        response = adapter.get_order(account_number, order_id)
+        summary = summarize_order_response(response)
+        print(format_order_status_summary(summary))
+        print(
+            "info: re-run with --confirm-sandbox-cancel to cancel this order",
+            file=sys.stderr,
+        )
+        return 0
+    except (SandboxApiError, SandboxAuthError) as exc:
+        if isinstance(exc, SandboxApiError):
+            print_api_error(exc)
+        else:
+            print_auth_error(exc)
+        return 1
+
+
+def _confirm_active_cleared(adapter: TastytradeSandboxAdapter, account_number: str) -> int:
+    summaries, code = _list_orders(adapter, account_number)
+    if code != 0:
+        print("warning: post-cancel live order re-fetch failed", file=sys.stderr)
+        return 1
+    active_live, _history = partition_orders_for_cancel_list(summaries)
+    active_count = len(active_live)
+    print(f"post_cancel_active_live_orders_count: {active_count}")
+    if active_count == 0:
+        print("post_cancel_verify: active live orders cleared")
+        return 0
+    print(
+        f"warning: {active_count} active live order(s) still present after cancel",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Tastytrade sandbox live-order list/cancel smoke")
     parser.add_argument("--order-id", default=None, help="Broker order id to preview/cancel")
@@ -92,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Cancel the order specified by --order-id",
     )
-    parser.add_argument("--with-db", action="store_true")
+    parser.add_argument("--with-db", action="store_true", help="Update DB cancel status if matched")
     parser.add_argument("--no-db", action="store_true")
     args = parser.parse_args(argv)
 
@@ -104,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --confirm-sandbox-cancel requires --order-id", file=sys.stderr)
         return 2
 
-    with_db = args.with_db and not args.no_db
+    with_db = bool(args.with_db) and not args.no_db
 
     print(f"warning: {WARNING}")
 
@@ -121,28 +208,15 @@ def main(argv: list[str] | None = None) -> int:
     adapter = TastytradeSandboxAdapter(settings)
     order_repo = _build_order_repo(settings, with_db)
 
-    try:
-        balance, _positions = fetch_account_state(adapter)
-    except (SandboxApiError, SandboxAuthError) as exc:
-        if isinstance(exc, SandboxApiError):
-            print_api_error(exc)
-        else:
-            print_auth_error(exc)
-        return 1
+    account_number, preflight_code = _oauth_and_account_preflight(adapter)
+    if preflight_code != 0 or not account_number:
+        return preflight_code
 
-    account_number = balance.get("account_number")
     print(f"selected_account: {account_number}")
 
-    try:
-        live_items = adapter.list_live_orders(account_number)
-        summaries = summarize_live_orders_response({"data": {"items": live_items}})
-        print(format_live_orders_summary(summaries))
-    except (SandboxApiError, SandboxAuthError) as exc:
-        if isinstance(exc, SandboxApiError):
-            print_api_error(exc)
-        else:
-            print_auth_error(exc)
-        return 1
+    summaries, list_code = _list_orders(adapter, account_number)
+    if list_code != 0:
+        return list_code
 
     if not args.order_id:
         return 0
@@ -152,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         cancel_response = adapter.cancel_order(account_number, args.order_id)
-        print(f"cancel_success: True")
+        print("cancel_success: True")
         print(f"broker_order_id: {args.order_id}")
         _update_db_cancel_status(
             order_repo,
@@ -160,7 +234,6 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             raw={"route": "sandbox", "cancelled": True, "response": cancel_response},
         )
-        return 0
     except (SandboxApiError, SandboxAuthError) as exc:
         if isinstance(exc, SandboxApiError):
             print_api_error(exc)
@@ -176,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
             raw={"route": "sandbox", "cancelled": False},
         )
         return 1
+
+    return _confirm_active_cleared(adapter, account_number)
 
 
 if __name__ == "__main__":

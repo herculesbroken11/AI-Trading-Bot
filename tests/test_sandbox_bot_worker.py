@@ -108,8 +108,34 @@ def test_active_live_order_blocks_trade():
     )
     worker = SandboxBotWorker(_settings(), adapter)
     result = worker.run_cycle(signal="bullish")
-    assert result.decision_status == "skipped_live_order_exists"
+    assert result.decision_status == "skipped_active_live_order_exists"
     assert result.active_live_orders_count == 1
+    adapter.dry_run_equity_order.assert_not_called()
+
+
+def test_oauth_unhealthy_skips_before_dry_run():
+    from backend.adapters.broker.sandbox_auth import SandboxAuthError
+
+    adapter = _clean_adapter()
+    adapter._auth.ensure_authenticated.side_effect = SandboxAuthError(
+        "Sandbox OAuth failed (400): wrong_sandbox_customer — Refresh token/grant does not map"
+    )
+    worker = SandboxBotWorker(_settings(), adapter)
+    result = worker.run_cycle(signal="bullish")
+    assert result.decision_status == "skipped_oauth_unhealthy"
+    assert result.success is True
+    adapter.dry_run_equity_order.assert_not_called()
+    adapter.get_accounts.assert_not_called()
+
+
+def test_account_unavailable_skips_before_dry_run():
+    adapter = _clean_adapter(
+        get_accounts=MagicMock(side_effect=SandboxApiError(503, "provider unavailable"))
+    )
+    worker = SandboxBotWorker(_settings(), adapter)
+    result = worker.run_cycle(signal="bullish")
+    assert result.decision_status == "skipped_account_unavailable"
+    assert result.success is True
     adapter.dry_run_equity_order.assert_not_called()
 
 
