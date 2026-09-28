@@ -117,6 +117,15 @@ def classify_oauth_failure(
     code = (error_code or "").lower()
     desc = (error_description or "").lower()
 
+    if status_code == 429:
+        return OAuthFailureClassification(
+            reason="rate_limited",
+            message="Sandbox OAuth rate limited (429).",
+            next_step=(
+                "Next step: wait before retrying; do not regenerate credentials. "
+                "Check cooldown with scripts/sandbox_cooldown_status.py."
+            ),
+        )
     if status_code in {502, 503, 504} or status_code >= 500:
         return OAuthFailureClassification(
             reason="provider_unavailable",

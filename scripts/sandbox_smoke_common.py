@@ -6,6 +6,11 @@ import sys
 from typing import Optional
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError
+from backend.adapters.broker.sandbox_cooldown import (
+    RATE_LIMITED_EXIT_CODE,
+    print_cooldown_advice,
+)
+from backend.adapters.broker.sandbox_rate_limiter import rate_limit_info_from
 from backend.adapters.broker.sandbox_env import (
     format_sandbox_env_report,
     sandbox_env_flags,
@@ -45,18 +50,26 @@ def print_env_check(settings) -> bool:
     return sandbox_env_ready_for_read(flags)
 
 
-def print_api_error(exc: SandboxApiError) -> None:
+def print_api_error(exc: SandboxApiError, *, next_command: Optional[str] = None) -> None:
     print("error: sandbox step failed", file=sys.stderr)
     if exc.step_diagnostics:
         print(exc.step_diagnostics.format_safe(), file=sys.stderr)
     else:
         print(exc.message, file=sys.stderr)
+    info = rate_limit_info_from(exc)
+    if info:
+        print_cooldown_advice(info, next_command=next_command)
 
 
-def print_auth_error(exc: SandboxAuthError) -> None:
+def print_auth_error(exc: SandboxAuthError, *, next_command: Optional[str] = None) -> None:
     from backend.adapters.broker.oauth_diagnostics import oauth_next_step_hint
 
     print("error: authentication failed", file=sys.stderr)
+    info = rate_limit_info_from(exc)
+    if info:
+        print(str(exc), file=sys.stderr)
+        print_cooldown_advice(info, next_command=next_command)
+        return
     if exc.diagnostics:
         print(exc.diagnostics.format_safe(), file=sys.stderr)
         print(oauth_next_step_hint(exc.diagnostics), file=sys.stderr)
@@ -66,9 +79,19 @@ def print_auth_error(exc: SandboxAuthError) -> None:
         print(str(exc), file=sys.stderr)
 
 
+def print_sandbox_error(exc: BaseException, *, next_command: Optional[str] = None) -> int:
+    """Print a sandbox API/auth error; return RATE_LIMITED_EXIT_CODE on 429, else 1."""
+    if isinstance(exc, SandboxApiError):
+        print_api_error(exc, next_command=next_command)
+    elif isinstance(exc, SandboxAuthError):
+        print_auth_error(exc, next_command=next_command)
+    else:
+        print(f"error: {type(exc).__name__}", file=sys.stderr)
+    return RATE_LIMITED_EXIT_CODE if rate_limit_info_from(exc) else 1
+
+
 def fetch_account_state(adapter: TastytradeSandboxAdapter) -> tuple[dict, list]:
     adapter._auth.ensure_authenticated()
-    adapter.get_customers_me()
     accounts = adapter.get_accounts()
     if not accounts:
         raise SandboxApiError(404, "No sandbox accounts returned")

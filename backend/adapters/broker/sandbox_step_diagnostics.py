@@ -232,7 +232,10 @@ def step_next_step_hint(diagnostics: StepFailureDiagnostics) -> str:
         return "Next step: sandbox instrumentation may lag — retry later."
 
     if status == 429:
-        return "Next step: rate limited — wait and retry."
+        return (
+            "Next step: rate_limited — wait before retrying; do not re-run scripts "
+            "back-to-back (see scripts/sandbox_cooldown_status.py)."
+        )
 
     if status >= 500:
         return "Next step: sandbox API server error — retry later."

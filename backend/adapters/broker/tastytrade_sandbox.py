@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -13,6 +13,12 @@ from backend.adapters.broker.sandbox_auth import SandboxAuthError, SandboxOAuthC
 from backend.adapters.broker.sandbox_http_retry import (
     is_transient_transport_error,
     should_retry_http_status,
+)
+from backend.adapters.broker.sandbox_rate_limiter import (
+    RateLimitCooldownActive,
+    RateLimitInfo,
+    SandboxRateLimiter,
+    get_sandbox_rate_limiter,
 )
 from backend.adapters.broker.sandbox_order_verification import (
     broker_status_is_filled,
@@ -36,6 +42,10 @@ from backend.risk.models import ExecutionResult, OrderIntent
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
+ACCOUNT_CACHE_TTL_SECONDS = 60.0
+READ_CACHE_TTL_SECONDS = 10.0
+MAX_TRANSIENT_ATTEMPTS = 3
+TRANSIENT_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
 CUSTOMERS_ME_ACCOUNTS_PATH = "/customers/me/accounts"
 EQUITY_BUY_ACTION = "Buy to Open"
 EQUITY_SELL_CLOSE_ACTION = "Sell to Close"
@@ -59,11 +69,17 @@ class SandboxApiError(Exception):
     message: str
     body: Optional[Dict[str, Any]] = None
     step_diagnostics: Optional[StepFailureDiagnostics] = None
+    rate_limit: Optional[RateLimitInfo] = None
 
     def __str__(self) -> str:
+        parts = []
         if self.step_diagnostics:
-            return self.step_diagnostics.format_safe()
-        return self.message
+            parts.append(self.step_diagnostics.format_safe())
+        else:
+            parts.append(self.message)
+        if self.rate_limit:
+            parts.append(self.rate_limit.format_safe())
+        return "\n".join(parts)
 
 
 def build_equity_order_payload(
@@ -140,19 +156,71 @@ class TastytradeSandboxAdapter:
     Base URL is hardcoded to https://api.cert.tastyworks.com.
     """
 
-    def __init__(self, settings: Settings, auth: Optional[SandboxOAuthClient] = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        auth: Optional[SandboxOAuthClient] = None,
+        *,
+        rate_limiter: Optional[SandboxRateLimiter] = None,
+        clock: Callable[[], float] = time.time,
+        account_cache_ttl: float = ACCOUNT_CACHE_TTL_SECONDS,
+        read_cache_ttl: float = READ_CACHE_TTL_SECONDS,
+    ) -> None:
         assert_sandbox_base_url(SANDBOX_BASE_URL)
         if settings.tastytrade_env.strip().lower() != "sandbox":
             raise SandboxAuthError("TastytradeSandboxAdapter requires TASTYTRADE_ENV=sandbox")
         if settings.live_trading_enabled:
             raise SandboxAuthError("LIVE_TRADING_ENABLED must be false for sandbox adapter")
         self._settings = settings
-        self._auth = auth or SandboxOAuthClient(settings)
+        self._rate_limiter = rate_limiter
+        self._auth = auth or SandboxOAuthClient(settings, rate_limiter=rate_limiter)
+        self._clock = clock
+        self._account_cache_ttl = account_cache_ttl
+        self._read_cache_ttl = read_cache_ttl
         self._selected_account: Optional[str] = None
+        self._selected_account_at: float = 0.0
+        self._accounts_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+        self._read_cache: Dict[Tuple[str, str], Tuple[float, Any]] = {}
 
     @property
     def base_url(self) -> str:
         return SANDBOX_BASE_URL
+
+    @property
+    def rate_limiter(self) -> SandboxRateLimiter:
+        return self._rate_limiter or get_sandbox_rate_limiter()
+
+    def invalidate_read_cache(self) -> None:
+        """Drop cached balances/positions/live orders after any state-changing call."""
+        self._read_cache.clear()
+
+    def _cached_read(self, kind: str, account: str, loader: Callable[[], Any], force_refresh: bool) -> Any:
+        key = (kind, account)
+        now = self._clock()
+        cached = self._read_cache.get(key)
+        if not force_refresh and cached and now - cached[0] < self._read_cache_ttl:
+            return cached[1]
+        value = loader()
+        self._read_cache[key] = (now, value)
+        return value
+
+    def _acquire(self, group: str, *, step: str, path: str) -> None:
+        try:
+            self.rate_limiter.acquire(group, step=step)
+        except RateLimitCooldownActive as exc:
+            raise SandboxApiError(
+                429,
+                f"Sandbox API cooldown active; {step} request not sent. Wait before retrying.",
+                step_diagnostics=StepFailureDiagnostics(
+                    step=step,
+                    status_code=429,
+                    endpoint_path=path,
+                    authorization_present=False,
+                    user_agent_present=True,
+                    provider_message="local cooldown active after prior 429; request not sent",
+                ),
+                rate_limit=exc.info,
+            ) from exc
 
     def _request(
         self,
@@ -160,48 +228,31 @@ class TastytradeSandboxAdapter:
         path: str,
         *,
         step: str,
+        group: str,
         json: Optional[Dict[str, Any]] = None,
     ) -> httpx.Response:
+        """
+        Throttled sandbox request.
+
+        Retries only 502/503/504 and transient transport errors. 429 is never retried:
+        it starts a cooldown and raises immediately so callers stop the workflow.
+        """
         url = f"{SANDBOX_BASE_URL}{path}"
         assert_sandbox_base_url(SANDBOX_BASE_URL)
         headers = self._auth.request_headers()
-        max_attempts = 3
-        backoff = (0.25, 0.5, 1.0)
         last_response: Optional[httpx.Response] = None
+        refreshed_after_401 = False
 
-        for attempt in range(max_attempts):
+        for attempt in range(MAX_TRANSIENT_ATTEMPTS):
+            is_last = attempt >= MAX_TRANSIENT_ATTEMPTS - 1
+            self._acquire(group, step=step, path=path)
             try:
                 with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
                     response = client.request(method, url, headers=headers, json=json)
-                    if response.status_code == 401 and attempt == 0:
-                        self._auth.refresh_access_token()
-                        headers = self._auth.request_headers()
-                        response = client.request(method, url, headers=headers, json=json)
-                    last_response = response
-                    if response.status_code < 400:
-                        return response
-                    if should_retry_http_status(response.status_code) and attempt < max_attempts - 1:
-                        time.sleep(backoff[min(attempt, len(backoff) - 1)])
-                        continue
-                    raise self._parse_error(
-                        response,
-                        step=step,
-                        path=path,
-                        request_headers=headers,
-                    )
-            except SandboxApiError:
-                raise
             except Exception as exc:
-                if is_transient_transport_error(exc) and attempt < max_attempts - 1:
-                    time.sleep(backoff[min(attempt, len(backoff) - 1)])
+                if is_transient_transport_error(exc) and not is_last:
+                    time.sleep(TRANSIENT_BACKOFF_SECONDS[min(attempt, len(TRANSIENT_BACKOFF_SECONDS) - 1)])
                     continue
-                if last_response is not None and last_response.status_code >= 400:
-                    raise self._parse_error(
-                        last_response,
-                        step=step,
-                        path=path,
-                        request_headers=headers,
-                    )
                 raise SandboxApiError(
                     503,
                     f"Sandbox API transport error for step {step}: {type(exc).__name__}",
@@ -214,6 +265,38 @@ class TastytradeSandboxAdapter:
                         provider_message=type(exc).__name__,
                     ),
                 ) from exc
+
+            last_response = response
+            status = response.status_code
+            if status < 400:
+                return response
+            if status == 429:
+                info = self.rate_limiter.record_rate_limited(
+                    group,
+                    step=step,
+                    retry_after=response.headers.get("Retry-After"),
+                )
+                raise self._parse_error(
+                    response,
+                    step=step,
+                    path=path,
+                    request_headers=headers,
+                    rate_limit=info,
+                )
+            if status == 401 and not refreshed_after_401 and not is_last:
+                refreshed_after_401 = True
+                self._auth.refresh_access_token()
+                headers = self._auth.request_headers()
+                continue
+            if should_retry_http_status(status) and not is_last:
+                time.sleep(TRANSIENT_BACKOFF_SECONDS[min(attempt, len(TRANSIENT_BACKOFF_SECONDS) - 1)])
+                continue
+            raise self._parse_error(
+                response,
+                step=step,
+                path=path,
+                request_headers=headers,
+            )
 
         assert last_response is not None
         raise self._parse_error(
@@ -231,6 +314,7 @@ class TastytradeSandboxAdapter:
         path: str,
         request_headers: Dict[str, str],
         symbol: Optional[str] = None,
+        rate_limit: Optional[RateLimitInfo] = None,
     ) -> SandboxApiError:
         step_diag = build_step_failure(
             step=step,
@@ -245,7 +329,11 @@ class TastytradeSandboxAdapter:
                 "One or more preflight checks failed."
             )
         elif response.status_code == 429:
-            msg = "Sandbox API rate limit (429). Retry after a short delay."
+            cooldown = int(round(rate_limit.cooldown_seconds)) if rate_limit else None
+            msg = (
+                f"Sandbox API rate_limited (429) at step {step}; wait before retrying"
+                + (f" (cooldown_seconds={cooldown})." if cooldown is not None else ".")
+            )
         elif response.status_code >= 500:
             msg = f"Sandbox API server error ({response.status_code})."
         elif response.status_code == 403:
@@ -263,6 +351,7 @@ class TastytradeSandboxAdapter:
             msg,
             body,
             step_diagnostics=step_diag,
+            rate_limit=rate_limit,
         )
 
     def _validate_equity_order(
@@ -329,7 +418,9 @@ class TastytradeSandboxAdapter:
         suffix = "/dry-run" if dry_run else ""
         step = "dry_run_order" if dry_run else "submit_order"
         path = f"/accounts/{acct}/orders{suffix}"
-        response = self._request("POST", path, step=step, json=order_data)
+        if not dry_run:
+            self.invalidate_read_cache()
+        response = self._request("POST", path, step=step, group="orders", json=order_data)
         return response.json()
 
     def _post_equity_close(
@@ -355,29 +446,49 @@ class TastytradeSandboxAdapter:
         suffix = "/dry-run" if dry_run else ""
         step = "dry_run_close" if dry_run else "submit_close"
         path = f"/accounts/{acct}/orders{suffix}"
-        response = self._request("POST", path, step=step, json=order_data)
+        if not dry_run:
+            self.invalidate_read_cache()
+        response = self._request("POST", path, step=step, group="orders", json=order_data)
         return response.json()
 
     def get_customers_me(self) -> Dict[str, Any]:
         """Fetch authenticated sandbox customer profile (read smoke step)."""
         self._auth.ensure_authenticated()
-        response = self._request("GET", "/customers/me", step="get_customers_me")
+        response = self._request("GET", "/customers/me", step="get_customers_me", group="customer")
         return response.json().get("data", {})
 
-    def get_accounts(self) -> List[Dict[str, Any]]:
-        """List sandbox accounts via GET /customers/me/accounts only (not GET /accounts)."""
+    def get_accounts(self, *, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """List sandbox accounts via GET /customers/me/accounts only (cached ~60s)."""
+        now = self._clock()
+        if (
+            not force_refresh
+            and self._accounts_cache is not None
+            and now - self._accounts_cache[0] < self._account_cache_ttl
+        ):
+            return list(self._accounts_cache[1])
         self._auth.ensure_authenticated()
         response = self._request(
             "GET",
             CUSTOMERS_ME_ACCOUNTS_PATH,
             step="get_accounts",
+            group="accounts",
         )
-        return response.json().get("data", {}).get("items", [])
+        items = response.json().get("data", {}).get("items", [])
+        items = items if isinstance(items, list) else []
+        self._accounts_cache = (now, items)
+        return list(items)
+
+    def get_selected_account(self) -> str:
+        """Selected sandbox account number (cached ~60s; reuses cached account list)."""
+        return self._resolve_account_number(None)
 
     def _resolve_account_number(self, account_number: Optional[str] = None) -> str:
         if account_number:
             return account_number
-        if self._selected_account:
+        if (
+            self._selected_account
+            and self._clock() - self._selected_account_at < self._account_cache_ttl
+        ):
             return self._selected_account
         accounts = self.get_accounts()
         if not accounts:
@@ -400,27 +511,46 @@ class TastytradeSandboxAdapter:
         if not number:
             raise SandboxApiError(404, "Could not resolve sandbox account number")
         self._selected_account = str(number)
+        self._selected_account_at = self._clock()
         return self._selected_account
 
-    def get_balance(self, account_number: Optional[str] = None) -> Dict[str, Any]:
+    def get_balance(
+        self,
+        account_number: Optional[str] = None,
+        *,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
         acct = self._resolve_account_number(account_number)
-        path = f"/accounts/{acct}/balances"
-        response = self._request("GET", path, step="get_balance")
-        payload = response.json().get("data", {})
-        return {
-            "account_number": acct,
-            "cash_balance": _coerce_amount(payload.get("cash-balance")),
-            "buying_power": _coerce_amount(
-                payload.get("day-trading-buying-power") or payload.get("equity-buying-power")
-            ),
-            "day_pnl": _coerce_amount(payload.get("day-pnl")),
-        }
 
-    def get_positions(self, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
+        def _load() -> Dict[str, Any]:
+            path = f"/accounts/{acct}/balances"
+            response = self._request("GET", path, step="get_balance", group="balances")
+            payload = response.json().get("data", {})
+            return {
+                "account_number": acct,
+                "cash_balance": _coerce_amount(payload.get("cash-balance")),
+                "buying_power": _coerce_amount(
+                    payload.get("day-trading-buying-power") or payload.get("equity-buying-power")
+                ),
+                "day_pnl": _coerce_amount(payload.get("day-pnl")),
+            }
+
+        return dict(self._cached_read("balances", acct, _load, force_refresh))
+
+    def get_positions(
+        self,
+        account_number: Optional[str] = None,
+        *,
+        force_refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
         acct = self._resolve_account_number(account_number)
-        path = f"/accounts/{acct}/positions"
-        response = self._request("GET", path, step="get_positions")
-        return response.json().get("data", {}).get("items", [])
+
+        def _load() -> List[Dict[str, Any]]:
+            path = f"/accounts/{acct}/positions"
+            response = self._request("GET", path, step="get_positions", group="positions")
+            return response.json().get("data", {}).get("items", [])
+
+        return list(self._cached_read("positions", acct, _load, force_refresh))
 
     def dry_run_equity_order(
         self,
@@ -471,7 +601,7 @@ class TastytradeSandboxAdapter:
     def get_order(self, account_number: Optional[str], order_id: str) -> Dict[str, Any]:
         acct = self._resolve_account_number(account_number)
         path = f"/accounts/{acct}/orders/{order_id}"
-        response = self._request("GET", path, step="get_order")
+        response = self._request("GET", path, step="get_order", group="orders")
         return response.json()
 
     def fetch_order_status_summary(
@@ -483,22 +613,32 @@ class TastytradeSandboxAdapter:
         response = self.get_order(account_number, order_id)
         return summarize_order_response(response)
 
-    def list_live_orders(self, account_number: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_live_orders(
+        self,
+        account_number: Optional[str] = None,
+        *,
+        force_refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
         """List live sandbox orders via GET /accounts/{account}/orders/live."""
         self._auth.ensure_authenticated()
         acct = self._resolve_account_number(account_number)
-        path = f"/accounts/{acct}/orders/live"
-        response = self._request("GET", path, step="list_live_orders")
-        payload = response.json().get("data", {})
-        items = payload.get("items", []) if isinstance(payload, dict) else []
-        return items if isinstance(items, list) else []
+
+        def _load() -> List[Dict[str, Any]]:
+            path = f"/accounts/{acct}/orders/live"
+            response = self._request("GET", path, step="list_live_orders", group="live_orders")
+            payload = response.json().get("data", {})
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+            return items if isinstance(items, list) else []
+
+        return list(self._cached_read("live_orders", acct, _load, force_refresh))
 
     def cancel_order(self, account_number: Optional[str], order_id: str) -> Dict[str, Any]:
         """Cancel sandbox order via DELETE /accounts/{account}/orders/{order_id}."""
         self._auth.ensure_authenticated()
         acct = self._resolve_account_number(account_number)
         path = f"/accounts/{acct}/orders/{order_id}"
-        response = self._request("DELETE", path, step="cancel_order")
+        self.invalidate_read_cache()
+        response = self._request("DELETE", path, step="cancel_order", group="cancel")
         if response.content:
             try:
                 return response.json()

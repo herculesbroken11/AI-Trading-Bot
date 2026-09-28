@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 
@@ -19,6 +20,12 @@ from backend.adapters.broker.sandbox_step_diagnostics import (
     StepFailureDiagnostics,
     build_step_failure,
 )
+from backend.adapters.broker.sandbox_rate_limiter import (
+    RateLimitCooldownActive,
+    RateLimitInfo,
+    SandboxRateLimiter,
+    get_sandbox_rate_limiter,
+)
 from backend.adapters.broker.sandbox_token_store import persist_sandbox_refresh_token
 from backend.config.settings import Settings
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, USER_AGENT, assert_sandbox_base_url
@@ -26,6 +33,9 @@ from backend.config.tastytrade_urls import SANDBOX_BASE_URL, USER_AGENT, assert_
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
+DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 900.0
+ACCESS_TOKEN_EXPIRY_MARGIN_SECONDS = 60.0
+OAUTH_RATE_GROUP = "oauth"
 
 
 class SandboxAuthError(RuntimeError):
@@ -37,24 +47,40 @@ class SandboxAuthError(RuntimeError):
         *,
         diagnostics: Optional[OAuthFailureDiagnostics] = None,
         step_diagnostics: Optional[StepFailureDiagnostics] = None,
+        rate_limit: Optional[RateLimitInfo] = None,
     ) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics
         self.step_diagnostics = step_diagnostics
+        self.rate_limit = rate_limit
 
 
 class SandboxOAuthClient:
     """Sandbox-only OAuth — never constructs production URLs."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        rate_limiter: Optional[SandboxRateLimiter] = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         assert_sandbox_base_url(SANDBOX_BASE_URL)
         if settings.tastytrade_env.strip().lower() != "sandbox":
             raise SandboxAuthError("Sandbox OAuth requires TASTYTRADE_ENV=sandbox")
         self._settings = settings
         self._access_token: Optional[str] = None
+        self._access_token_expires_at: float = 0.0
         self._refresh_token: Optional[str] = settings.tastytrade_refresh_token.strip() or None
         self._oauth_attempted = False
         self._oauth_failed = False
+        self._rate_limiter = rate_limiter
+        self._clock = clock
+        self._token_request_count = 0
+
+    @property
+    def rate_limiter(self) -> SandboxRateLimiter:
+        return self._rate_limiter or get_sandbox_rate_limiter()
 
     @property
     def base_url(self) -> str:
@@ -62,11 +88,20 @@ class SandboxOAuthClient:
 
     @property
     def is_authenticated(self) -> bool:
-        return bool(self._access_token)
+        return self._token_is_fresh()
 
     @property
     def oauth_attempted(self) -> bool:
         return self._oauth_attempted
+
+    @property
+    def token_request_count(self) -> int:
+        return self._token_request_count
+
+    def _token_is_fresh(self) -> bool:
+        if not self._access_token:
+            return False
+        return self._clock() < self._access_token_expires_at - ACCESS_TOKEN_EXPIRY_MARGIN_SECONDS
 
     def credential_flags(self) -> Dict[str, bool]:
         return {
@@ -77,14 +112,15 @@ class SandboxOAuthClient:
         }
 
     def ensure_authenticated(self) -> None:
-        if self._access_token:
+        """Reuse the cached access token until near expiry; refresh only when needed."""
+        if self._token_is_fresh():
             return
         if self._oauth_failed:
             raise SandboxAuthError(
                 "Sandbox OAuth already failed in this session. "
                 "Fix credentials and restart — OAuth is not retried automatically."
             )
-        if self._oauth_attempted:
+        if self._oauth_attempted and not self._access_token:
             raise SandboxAuthError(
                 "Sandbox OAuth already attempted without success. "
                 "Fix credentials and restart."
@@ -149,7 +185,16 @@ class SandboxOAuthClient:
         if not client_secret or not refresh:
             raise SandboxAuthError("Missing sandbox OAuth credentials in settings")
 
+        try:
+            self.rate_limiter.acquire(OAUTH_RATE_GROUP, step="oauth_token")
+        except RateLimitCooldownActive as exc:
+            raise SandboxAuthError(
+                f"Sandbox OAuth not attempted: {exc} Wait before retrying.",
+                rate_limit=exc.info,
+            ) from exc
+
         self._oauth_attempted = True
+        self._token_request_count += 1
         payload = self._build_refresh_payload()
         flags = self.credential_flags()
 
@@ -172,6 +217,32 @@ class SandboxOAuthClient:
             raise SandboxAuthError(
                 f"Sandbox OAuth request failed: {type(exc).__name__}. Check network connectivity."
             ) from exc
+
+        if response.status_code == 429:
+            # Throttling is not a credential failure: keep _oauth_failed False.
+            info = self.rate_limiter.record_rate_limited(
+                OAUTH_RATE_GROUP,
+                step="oauth_token",
+                retry_after=response.headers.get("Retry-After"),
+            )
+            self._oauth_attempted = False
+            diagnostics = build_oauth_diagnostics(
+                status_code=429,
+                response_text=response.text,
+                grant_type=REFRESH_GRANT_TYPE,
+                client_id_configured=flags["client_id_configured"],
+                client_secret_configured=flags["client_secret_configured"],
+                refresh_token_configured=flags["refresh_token_configured"],
+                redirect_uri_configured=flags["redirect_uri_configured"],
+            )
+            raise SandboxAuthError(
+                (
+                    "Sandbox OAuth failed (429): rate_limited — "
+                    f"wait before retrying (cooldown_seconds={int(round(info.cooldown_seconds))})."
+                ),
+                diagnostics=diagnostics,
+                rate_limit=info,
+            )
 
         if response.status_code >= 400:
             self._oauth_failed = True
@@ -217,6 +288,7 @@ class SandboxOAuthClient:
 
         data = self._parse_token_response(response)
         self._access_token = data.get("access_token")
+        self._access_token_expires_at = self._clock() + self._token_ttl(data)
         previous_refresh = refresh
         next_refresh = data.get("refresh_token") or refresh
         if isinstance(next_refresh, str):
@@ -233,6 +305,15 @@ class SandboxOAuthClient:
             )
         if not self._access_token:
             raise SandboxAuthError("Token response missing access_token")
+
+    @staticmethod
+    def _token_ttl(data: Dict[str, Any]) -> float:
+        raw = data.get("expires_in")
+        try:
+            ttl = float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        return ttl if ttl > 0 else DEFAULT_ACCESS_TOKEN_TTL_SECONDS
 
     @staticmethod
     def _parse_token_response(response: httpx.Response) -> Dict[str, Any]:

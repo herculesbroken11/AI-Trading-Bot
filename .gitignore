@@ -56,5 +56,9 @@ Thumbs.db
 *.log
 logs/
 
+# Local Tastytrade sandbox throttle/cooldown state
+.sandbox_rate_state.json
+.sandbox_rate_state.json.tmp
+
 # Documentation (local only — not pushed to remote)
 docs/

@@ -12,6 +12,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError
+from backend.adapters.broker.sandbox_cooldown import RATE_LIMITED_EXIT_CODE, print_cooldown_advice
+from backend.adapters.broker.sandbox_rate_limiter import rate_limit_info_from
 from backend.adapters.broker.sandbox_env import (
     format_sandbox_env_report,
     sandbox_env_flags,
@@ -21,6 +23,8 @@ from backend.adapters.broker.sandbox_step_diagnostics import StepFailureDiagnost
 from backend.adapters.broker.tastytrade_sandbox import SandboxApiError, TastytradeSandboxAdapter
 from backend.config.settings import ConfigurationError, load_settings, reset_settings_cache
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, assert_sandbox_base_url
+
+READ_COMMAND = "py -3.11 scripts/smoke_tastytrade_sandbox_read.py"
 
 
 def _print_env_check(settings) -> bool:
@@ -70,7 +74,21 @@ def _print_api_error(exc: SandboxApiError) -> None:
     print(exc.message, file=sys.stderr)
 
 
+def _fail(exc: BaseException) -> int:
+    """Print safe diagnostics; stop the workflow. Returns 3 when rate limited."""
+    if isinstance(exc, SandboxApiError):
+        _print_api_error(exc)
+    elif isinstance(exc, SandboxAuthError):
+        _print_auth_error(exc)
+    info = rate_limit_info_from(exc)
+    if info:
+        print_cooldown_advice(info, next_command=READ_COMMAND)
+        return RATE_LIMITED_EXIT_CODE
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    """One call per endpoint: oauth, customers/me, accounts, balances, positions."""
     parser = argparse.ArgumentParser(description="Tastytrade sandbox read-only smoke test")
     parser.parse_args(argv)
 
@@ -92,27 +110,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         adapter._auth.ensure_authenticated()
-    except SandboxAuthError as exc:
-        _print_auth_error(exc)
-        return 1
-
-    try:
         adapter.get_customers_me()
-    except SandboxApiError as exc:
-        _print_api_error(exc)
-        return 1
-    except SandboxAuthError as exc:
-        _print_auth_error(exc)
-        return 1
-
-    try:
         accounts = adapter.get_accounts()
-    except SandboxApiError as exc:
-        _print_api_error(exc)
-        return 1
-    except SandboxAuthError as exc:
-        _print_auth_error(exc)
-        return 1
+    except (SandboxApiError, SandboxAuthError) as exc:
+        return _fail(exc)
 
     account_count = len(accounts)
     if account_count == 0:
@@ -121,21 +122,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         balance = adapter.get_balance()
-    except (SandboxApiError, SandboxAuthError) as exc:
-        if isinstance(exc, SandboxApiError):
-            _print_api_error(exc)
-        else:
-            _print_auth_error(exc)
-        return 1
-
-    try:
         positions = adapter.get_positions(balance.get("account_number"))
     except (SandboxApiError, SandboxAuthError) as exc:
-        if isinstance(exc, SandboxApiError):
-            _print_api_error(exc)
-        else:
-            _print_auth_error(exc)
-        return 1
+        return _fail(exc)
 
     print(f"authenticated: {adapter._auth.is_authenticated}")
     print(f"sandbox_base_url: {SANDBOX_BASE_URL}")

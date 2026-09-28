@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError
+from backend.adapters.broker.sandbox_rate_limiter import RateLimitInfo, rate_limit_info_from
 from backend.adapters.broker.sandbox_order_verification import (
     broker_order_id_from_execution,
     partition_orders_for_cancel_list,
@@ -62,9 +63,10 @@ class SandboxBotCycleResult:
     risk_approved: Optional[bool] = None
     limit_price: Optional[float] = None
     order_type: str = "Limit"
+    cooldown_seconds: Optional[int] = None
 
     def to_safe_summary(self) -> Dict[str, Any]:
-        return {
+        summary: Dict[str, Any] = {
             "success": self.success,
             "decision_status": self.decision_status,
             "signal": self.signal,
@@ -83,6 +85,11 @@ class SandboxBotCycleResult:
             "order_type": self.order_type,
             "warnings": list(self.warnings),
         }
+        if self.cooldown_seconds is not None:
+            summary["failure_reason"] = "rate_limited"
+            summary["cooldown_seconds"] = self.cooldown_seconds
+            summary["next_step"] = "wait before retrying"
+        return summary
 
 
 def validate_sandbox_worker_settings(settings: Settings) -> None:
@@ -206,9 +213,15 @@ class SandboxBotWorker:
         warnings: List[str] = []
 
         # --- OAuth / account / live-order preflight (before dry-run or submit) ---
+        # Any 429 (or active cooldown) stops the cycle before dry-run/submit.
         try:
             self._adapter._auth.ensure_authenticated()
         except SandboxAuthError as exc:
+            info = rate_limit_info_from(exc)
+            if info:
+                return self._rate_limited_result(
+                    info, normalized_signal, normalized_order_type, limit_price, warnings
+                )
             message = str(exc)
             self._log_error("sandbox_worker.oauth_preflight", exc, warnings)
             result = SandboxBotCycleResult(
@@ -224,7 +237,6 @@ class SandboxBotWorker:
             return result
 
         try:
-            self._adapter.get_customers_me()
             accounts = self._adapter.get_accounts()
             if not accounts:
                 result = SandboxBotCycleResult(
@@ -259,34 +271,15 @@ class SandboxBotWorker:
             live_summaries = summarize_live_orders_response({"data": {"items": live_items}})
             active_live, _history = partition_orders_for_cancel_list(live_summaries)
             active_live_count = len(active_live)
-        except SandboxAuthError as exc:
-            message = str(exc)
-            self._log_error("sandbox_worker.oauth_preflight", exc, warnings)
-            result = SandboxBotCycleResult(
-                success=True,
-                decision_status="skipped_oauth_unhealthy",
-                signal=normalized_signal,
-                message=message,
-                warnings=warnings,
-                order_type=normalized_order_type,
-                limit_price=limit_price,
+        except (SandboxAuthError, SandboxApiError) as exc:
+            info = rate_limit_info_from(exc)
+            if info:
+                return self._rate_limited_result(
+                    info, normalized_signal, normalized_order_type, limit_price, warnings
+                )
+            return self._preflight_failure(
+                exc, normalized_signal, normalized_order_type, limit_price, warnings
             )
-            self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
-            return result
-        except SandboxApiError as exc:
-            message = str(exc)
-            self._log_error("sandbox_worker.account_preflight", exc, warnings)
-            result = SandboxBotCycleResult(
-                success=True,
-                decision_status="skipped_account_unavailable",
-                signal=normalized_signal,
-                message=message,
-                warnings=warnings,
-                order_type=normalized_order_type,
-                limit_price=limit_price,
-            )
-            self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
-            return result
 
         try:
             self._log_account_snapshot(balance, positions, positions_count, warnings)
@@ -372,6 +365,17 @@ class SandboxBotWorker:
                     limit_price=limit_price if normalized_order_type == "Limit" else None,
                 )
             except (SandboxApiError, SandboxAuthError) as exc:
+                info = rate_limit_info_from(exc)
+                if info:
+                    result = self._rate_limited_result(
+                        info, normalized_signal, normalized_order_type, limit_price, warnings
+                    )
+                    result.symbol = symbol
+                    result.account_number = account_number
+                    result.active_live_orders_count = active_live_count
+                    result.positions_count = positions_count
+                    result.risk_approved = True
+                    return result
                 self._log_dry_run_result(False, symbol, str(exc), warnings)
                 return SandboxBotCycleResult(
                     success=False,
@@ -410,16 +414,8 @@ class SandboxBotWorker:
 
             execution = self._executor.execute(intent, context)
             broker_order_id = broker_order_id_from_execution(execution.order_id, execution.raw)
+            # The adapter already fetched order status right after submit; reuse it.
             broker_status = (execution.raw or {}).get("broker_status")
-            if broker_order_id:
-                try:
-                    status_summary = self._adapter.fetch_order_status_summary(
-                        account_number,
-                        broker_order_id,
-                    )
-                    broker_status = status_summary.get("broker_status") or broker_status
-                except (SandboxApiError, SandboxAuthError) as exc:
-                    warnings.append(f"broker status fetch failed: {exc}")
 
             if not execution.success:
                 return SandboxBotCycleResult(
@@ -485,6 +481,61 @@ class SandboxBotWorker:
                 message="Sandbox bot cycle failed",
                 warnings=warnings,
             )
+
+    def _rate_limited_result(
+        self,
+        info: RateLimitInfo,
+        signal: str,
+        order_type: str,
+        limit_price: Optional[float],
+        warnings: List[str],
+    ) -> SandboxBotCycleResult:
+        cooldown = max(1, int(round(info.cooldown_seconds)))
+        message = (
+            f"Tastytrade sandbox rate_limited at step {info.step}; "
+            f"wait {cooldown}s before retrying. No dry-run or submit attempted."
+        )
+        result = SandboxBotCycleResult(
+            success=False,
+            decision_status="skipped_rate_limited",
+            signal=signal,
+            message=message,
+            warnings=warnings,
+            order_type=order_type,
+            limit_price=limit_price,
+            dry_run_passed=False,
+            submitted=False,
+            cooldown_seconds=cooldown,
+        )
+        self._log_skipped(result.decision_status, message, signal, warnings)
+        return result
+
+    def _preflight_failure(
+        self,
+        exc: BaseException,
+        signal: str,
+        order_type: str,
+        limit_price: Optional[float],
+        warnings: List[str],
+    ) -> SandboxBotCycleResult:
+        if isinstance(exc, SandboxAuthError):
+            status = "skipped_oauth_unhealthy"
+            source = "sandbox_worker.oauth_preflight"
+        else:
+            status = "skipped_account_unavailable"
+            source = "sandbox_worker.account_preflight"
+        self._log_error(source, exc, warnings)
+        result = SandboxBotCycleResult(
+            success=True,
+            decision_status=status,
+            signal=signal,
+            message=str(exc),
+            warnings=warnings,
+            order_type=order_type,
+            limit_price=limit_price,
+        )
+        self._log_skipped(result.decision_status, result.message, signal, warnings)
+        return result
 
     def _build_context(self, balance: dict, positions_count: int, price: float) -> RiskContext:
         buying_power = _coerce_balance_amount(balance.get("buying_power"))

@@ -11,6 +11,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.adapters.broker.sandbox_cooldown import COOLDOWN_STATUS_COMMAND, RATE_LIMITED_EXIT_CODE
 from backend.bot_worker.sandbox_worker import SandboxBotWorker
 from backend.config.settings import ConfigurationError, reset_settings_cache
 from scripts.sandbox_smoke_common import print_env_check, validate_sandbox_env
@@ -67,6 +68,19 @@ def main(argv: list[str] | None = None) -> int:
         confirm_submit=args.confirm_sandbox_submit,
     )
     _print_summary(result)
+
+    if result.decision_status == "skipped_rate_limited":
+        cooldown = result.cooldown_seconds or 60
+        print(
+            f"recommended_wait_seconds: {cooldown}\n"
+            "warning: do NOT retry immediately — repeated calls extend the Tastytrade sandbox "
+            "rate limit.\n"
+            f"check_cooldown_command: {COOLDOWN_STATUS_COMMAND}\n"
+            f"safe_next_command (after {cooldown}s): "
+            f"py -3.11 scripts/run_sandbox_bot_cycle.py --signal {args.signal}",
+            file=sys.stderr,
+        )
+        return RATE_LIMITED_EXIT_CODE
 
     if result.decision_status in {
         "skipped_no_signal",

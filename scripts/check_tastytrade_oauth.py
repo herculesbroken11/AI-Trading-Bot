@@ -16,13 +16,17 @@ from backend.adapters.broker.env_file_diagnostics import (
 )
 from backend.adapters.broker.oauth_diagnostics import oauth_next_step_hint
 from backend.adapters.broker.sandbox_auth import SandboxAuthError, SandboxOAuthClient
+from backend.adapters.broker.sandbox_cooldown import RATE_LIMITED_EXIT_CODE, print_cooldown_advice
 from backend.adapters.broker.sandbox_env import (
     format_sandbox_env_report,
     sandbox_env_flags,
 )
+from backend.adapters.broker.sandbox_rate_limiter import rate_limit_info_from
 from backend.adapters.broker.tastytrade_sandbox import SandboxApiError, TastytradeSandboxAdapter
 from backend.config.settings import ConfigurationError, load_settings, reset_settings_cache
 from backend.config.tastytrade_urls import SANDBOX_BASE_URL, assert_sandbox_base_url
+
+CHECK_COMMAND = "py -3.11 scripts/check_tastytrade_oauth.py"
 
 REQUIRED_KEYS = (
     "TASTYTRADE_CLIENT_ID",
@@ -152,6 +156,16 @@ def main() -> int:
     try:
         auth.ensure_authenticated()
     except SandboxAuthError as exc:
+        info = rate_limit_info_from(exc)
+        if info:
+            _print_failure(
+                step="oauth_token",
+                status_code=429,
+                provider_message="rate limited",
+                failure_reason=info.failure_reason,
+            )
+            print_cooldown_advice(info, next_command=CHECK_COMMAND, stream=sys.stdout)
+            return RATE_LIMITED_EXIT_CODE
         status = exc.diagnostics.status_code if exc.diagnostics else None
         reason = exc.diagnostics.failure_reason if exc.diagnostics else None
         provider_message = None
@@ -173,15 +187,35 @@ def main() -> int:
         )
 
     print("authenticated: true")
-    adapter = TastytradeSandboxAdapter(settings)
-    # Reuse authenticated client if adapter creates its own — call account APIs.
+    # Share the authenticated client so the adapter does not request a second token.
+    adapter = TastytradeSandboxAdapter(settings, auth=auth)
     try:
-        adapter._auth.ensure_authenticated()
         accounts = adapter.get_accounts()
         account_count = len(accounts)
-        balance = adapter.get_balance() if accounts else {}
-        selected = balance.get("account_number") if isinstance(balance, dict) else None
-    except SandboxAuthError as exc:
+        selected = adapter.get_selected_account() if accounts else None
+    except (SandboxAuthError, SandboxApiError) as exc:
+        return _account_read_failure(exc)
+
+    print(f"account_count: {account_count}")
+    print(f"selected_account: {selected or 'none'}")
+    print("error_step: none")
+    print("oauth_check: passed")
+    return 0
+
+
+def _account_read_failure(exc: BaseException) -> int:
+    info = rate_limit_info_from(exc)
+    if info:
+        _print_failure(
+            step="get_accounts",
+            authenticated=True,
+            status_code=429,
+            provider_message="rate limited",
+            failure_reason=info.failure_reason,
+        )
+        print_cooldown_advice(info, next_command=CHECK_COMMAND, stream=sys.stdout)
+        return RATE_LIMITED_EXIT_CODE
+    if isinstance(exc, SandboxAuthError):
         status = exc.diagnostics.status_code if exc.diagnostics else None
         reason = exc.diagnostics.failure_reason if exc.diagnostics else "oauth_unhealthy"
         next_step = oauth_next_step_hint(exc.diagnostics) if exc.diagnostics else None
@@ -193,7 +227,7 @@ def main() -> int:
             failure_reason=reason,
             next_step=next_step,
         )
-    except SandboxApiError as exc:
+    if isinstance(exc, SandboxApiError):
         provider_message = (
             exc.step_diagnostics.provider_message
             if exc.step_diagnostics and exc.step_diagnostics.provider_message
@@ -207,12 +241,7 @@ def main() -> int:
             failure_reason="account_unavailable",
             next_step="Next step: confirm sandbox account exists for this grant.",
         )
-
-    print(f"account_count: {account_count}")
-    print(f"selected_account: {selected or 'none'}")
-    print("error_step: none")
-    print("oauth_check: passed")
-    return 0
+    return _print_failure(step="account_read", authenticated=True, provider_message=type(exc).__name__)
 
 
 if __name__ == "__main__":
