@@ -35,6 +35,8 @@ from backend.config.tastytrade_urls import (
     ALLOWED_SANDBOX_SYMBOLS,
     SANDBOX_BASE_URL,
     SANDBOX_MAX_ORDER_QUANTITY,
+    BrokerUrlBlockedError,
+    assert_execution_component,
     assert_sandbox_base_url,
 )
 from backend.risk.models import ExecutionResult, OrderIntent
@@ -171,6 +173,10 @@ class TastytradeSandboxAdapter:
             raise SandboxAuthError("TastytradeSandboxAdapter requires TASTYTRADE_ENV=sandbox")
         if settings.live_trading_enabled:
             raise SandboxAuthError("LIVE_TRADING_ENABLED must be false for sandbox adapter")
+        try:
+            assert_execution_component(auth, role="TastytradeSandboxAdapter.auth")
+        except BrokerUrlBlockedError as exc:
+            raise SandboxAuthError(str(exc)) from exc
         self._settings = settings
         self._rate_limiter = rate_limiter
         self._auth = auth or SandboxOAuthClient(settings, rate_limiter=rate_limiter)

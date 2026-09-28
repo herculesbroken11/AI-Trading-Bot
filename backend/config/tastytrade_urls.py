@@ -50,3 +50,67 @@ def assert_sandbox_base_url(url: str) -> None:
 def is_production_url(url: str) -> bool:
     normalized = (url or "").lower()
     return PRODUCTION_BASE_URL.lower() in normalized or "api.tastytrade.com" in normalized
+
+
+# Production market data (Checkpoint 2.9): read-only quotes. Only these
+# (method, path) pairs may ever reach the production host.
+MARKET_DATA_BASE_URL = PRODUCTION_BASE_URL
+MARKET_DATA_OAUTH_PATH = "/oauth/token"
+MARKET_DATA_QUOTES_PATH = "/market-data/by-type"
+MARKET_DATA_ALLOWED_REQUESTS = frozenset(
+    {
+        ("POST", MARKET_DATA_OAUTH_PATH),
+        ("GET", MARKET_DATA_QUOTES_PATH),
+    }
+)
+
+
+class MarketDataUrlBlockedError(BrokerUrlBlockedError):
+    """Raised when a market-data request targets anything other than quote/auth endpoints."""
+
+
+class MarketDataCredentialMisuseError(BrokerUrlBlockedError):
+    """Raised when a production market-data component is handed to the execution path."""
+
+
+def assert_execution_component(component: object, *, role: str) -> None:
+    """
+    Fail closed if an execution-path component is a market-data-only object
+    (production credentials) or points at a production host.
+    """
+    if component is None:
+        return
+    if getattr(component, "IS_MARKET_DATA_ONLY", False) is True:
+        raise MarketDataCredentialMisuseError(
+            f"{role}: production market-data credentials/clients cannot be used for "
+            "order execution. Execution is sandbox-only."
+        )
+    base_url = getattr(component, "base_url", None)
+    if isinstance(base_url, str) and is_production_url(base_url):
+        raise MarketDataCredentialMisuseError(
+            f"{role}: production host {base_url!r} is blocked for order execution."
+        )
+
+
+def assert_market_data_request(method: str, url: str) -> None:
+    """
+    Allow only production OAuth token refresh and quote snapshots.
+
+    Any account, order, position or balance path on production fails closed.
+    """
+    from urllib.parse import urlsplit
+
+    verb = (method or "").strip().upper()
+    parts = urlsplit((url or "").strip())
+    origin = f"{parts.scheme}://{parts.netloc}".lower()
+    if origin != MARKET_DATA_BASE_URL.lower():
+        raise MarketDataUrlBlockedError(
+            f"Market data host {parts.netloc!r} is not permitted; "
+            f"only {MARKET_DATA_BASE_URL} is used for read-only quotes."
+        )
+    path = (parts.path or "/").rstrip("/") or "/"
+    if (verb, path) not in MARKET_DATA_ALLOWED_REQUESTS:
+        raise MarketDataUrlBlockedError(
+            f"Production request {verb} {path} is blocked. Production is market-data "
+            "only; orders/accounts/positions are never sent to production."
+        )

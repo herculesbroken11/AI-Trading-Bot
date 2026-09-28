@@ -59,6 +59,8 @@ logs/
 # Local Tastytrade sandbox throttle/cooldown state
 .sandbox_rate_state.json
 .sandbox_rate_state.json.tmp
+.market_data_rate_state.json
+.market_data_rate_state.json.tmp
 
 # Documentation (local only — not pushed to remote)
 docs/

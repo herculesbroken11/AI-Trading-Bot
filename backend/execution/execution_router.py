@@ -6,7 +6,12 @@ from typing import Optional
 
 from backend.adapters.broker.tastytrade_sandbox import TastytradeSandboxAdapter
 from backend.config.settings import Settings
-from backend.config.tastytrade_urls import ALLOWED_SANDBOX_SYMBOLS, SANDBOX_MAX_ORDER_QUANTITY
+from backend.config.tastytrade_urls import (
+    ALLOWED_SANDBOX_SYMBOLS,
+    SANDBOX_MAX_ORDER_QUANTITY,
+    BrokerUrlBlockedError,
+    assert_execution_component,
+)
 from backend.execution.paper_simulator import PaperSimulator
 from backend.risk.live_guard import (
     BrokerEnvironmentBlockedError,
@@ -25,6 +30,7 @@ class ExecutionRouter:
         paper_simulator: PaperSimulator | None = None,
         sandbox_adapter: Optional[TastytradeSandboxAdapter] = None,
     ) -> None:
+        assert_execution_component(sandbox_adapter, role="ExecutionRouter.sandbox_adapter")
         self._paper = paper_simulator or PaperSimulator()
         self._sandbox = sandbox_adapter
 
@@ -108,6 +114,11 @@ class ExecutionRouter:
                 message="Sandbox adapter is not configured for this router instance",
                 raw={"route": "sandbox", "placed": False},
             )
+
+        try:
+            assert_execution_component(self._sandbox, role="ExecutionRouter.sandbox_adapter")
+        except BrokerUrlBlockedError as exc:
+            return self._blocked_result(intent, str(exc), "rejected")
 
         return self._sandbox.execute_order(intent)
 

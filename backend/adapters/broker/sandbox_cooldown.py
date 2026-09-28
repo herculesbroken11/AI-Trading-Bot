@@ -16,15 +16,22 @@ def recommended_wait_seconds(info: RateLimitInfo) -> int:
     return max(1, int(math.ceil(info.cooldown_seconds)))
 
 
-def format_cooldown_advice(info: RateLimitInfo, *, next_command: Optional[str] = None) -> str:
+def format_cooldown_advice(
+    info: RateLimitInfo,
+    *,
+    next_command: Optional[str] = None,
+    label: str = "sandbox",
+    status_command: Optional[str] = COOLDOWN_STATUS_COMMAND,
+) -> str:
     wait = recommended_wait_seconds(info)
     lines = [
-        "--- sandbox rate limit ---",
+        f"--- {label} rate limit ---",
         info.format_safe(),
         f"recommended_wait_seconds: {wait}",
-        "warning: do NOT retry immediately — repeated calls extend the Tastytrade sandbox rate limit.",
-        f"check_cooldown_command: {COOLDOWN_STATUS_COMMAND}",
+        f"warning: do NOT retry immediately — repeated calls extend the Tastytrade {label} rate limit.",
     ]
+    if status_command:
+        lines.append(f"check_cooldown_command: {status_command}")
     if next_command:
         lines.append(f"safe_next_command (after {wait}s): {next_command}")
     return "\n".join(lines)
@@ -35,5 +42,15 @@ def print_cooldown_advice(
     *,
     next_command: Optional[str] = None,
     stream: Optional[TextIO] = None,
+    label: str = "sandbox",
+    status_command: Optional[str] = COOLDOWN_STATUS_COMMAND,
 ) -> None:
-    print(format_cooldown_advice(info, next_command=next_command), file=stream or sys.stderr)
+    print(
+        format_cooldown_advice(
+            info,
+            next_command=next_command,
+            label=label,
+            status_command=status_command,
+        ),
+        file=stream or sys.stderr,
+    )

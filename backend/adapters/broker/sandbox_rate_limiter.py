@@ -199,7 +199,7 @@ class SandboxRateLimiter:
         last = data.get("last_request")
         if isinstance(last, dict):
             for group, stamp in last.items():
-                if group in ENDPOINT_GROUPS and isinstance(stamp, (int, float)):
+                if group in self.min_intervals and isinstance(stamp, (int, float)):
                     self._last_request[group] = max(self._last_request.get(group, 0.0), float(stamp))
         cooldown = data.get("cooldown_until")
         if isinstance(cooldown, (int, float)):

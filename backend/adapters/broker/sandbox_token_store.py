@@ -1,4 +1,4 @@
-"""Persist rotated sandbox OAuth refresh tokens without logging secrets."""
+"""Persist rotated OAuth refresh tokens without logging secrets."""
 
 from __future__ import annotations
 
@@ -13,24 +13,24 @@ logger = logging.getLogger(__name__)
 REFRESH_TOKEN_ENV_KEY = "TASTYTRADE_REFRESH_TOKEN"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_ENV_PATH = _REPO_ROOT / ".env"
-_KEY_LINE_RE = re.compile(rf"^{re.escape(REFRESH_TOKEN_ENV_KEY)}\s*=")
 
 
 def default_env_path() -> Path:
     return _DEFAULT_ENV_PATH
 
 
-def persist_sandbox_refresh_token(
+def persist_refresh_token(
     new_refresh_token: str,
     *,
+    env_key: str,
     env_path: Optional[Path] = None,
     previous_refresh_token: Optional[str] = None,
+    label: str = "sandbox",
 ) -> bool:
     """
-    Write rotated refresh token to .env and process env.
+    Write a rotated refresh token to .env (under env_key) and the process env.
 
-    Returns True when a file write occurred.
-    Never logs token values.
+    Returns True when a file write occurred. Never logs token values.
     """
     token = (new_refresh_token or "").strip()
     if not token:
@@ -40,8 +40,10 @@ def persist_sandbox_refresh_token(
     if previous and token == previous:
         return False
 
+    key_line_re = re.compile(rf"^{re.escape(env_key)}\s*=")
+
     # Keep in-process env in sync even if .env is missing.
-    os.environ[REFRESH_TOKEN_ENV_KEY] = token
+    os.environ[env_key] = token
 
     path = env_path if env_path is not None else default_env_path()
     try:
@@ -52,13 +54,13 @@ def persist_sandbox_refresh_token(
             new_lines = []
             for line in lines:
                 stripped = line.lstrip("\ufeff")
-                if _KEY_LINE_RE.match(stripped):
+                if key_line_re.match(stripped):
                     ending = ""
                     if line.endswith("\r\n"):
                         ending = "\r\n"
                     elif line.endswith("\n"):
                         ending = "\n"
-                    new_lines.append(f"{REFRESH_TOKEN_ENV_KEY}={token}{ending}")
+                    new_lines.append(f"{env_key}={token}{ending}")
                     updated = True
                 else:
                     new_lines.append(line)
@@ -66,20 +68,35 @@ def persist_sandbox_refresh_token(
                 suffix = ""
                 if lines and not lines[-1].endswith("\n"):
                     suffix = "\n"
-                new_lines.append(f"{suffix}{REFRESH_TOKEN_ENV_KEY}={token}\n")
+                new_lines.append(f"{suffix}{env_key}={token}\n")
             path.write_text("".join(new_lines), encoding="utf-8")
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"{REFRESH_TOKEN_ENV_KEY}={token}\n", encoding="utf-8")
+            path.write_text(f"{env_key}={token}\n", encoding="utf-8")
     except OSError as exc:
         logger.warning(
-            "sandbox refresh token rotated but could not persist to .env (%s). "
-            "Create a new sandbox grant and update TASTYTRADE_REFRESH_TOKEN manually.",
+            "%s refresh token rotated but could not persist to .env (%s). "
+            "Create a new grant and update %s manually.",
+            label,
             type(exc).__name__,
+            env_key,
         )
         return False
 
-    logger.info(
-        "sandbox refresh token rotated and persisted to .env (value not logged)"
-    )
+    logger.info("%s refresh token rotated and persisted to .env (value not logged)", label)
     return True
+
+
+def persist_sandbox_refresh_token(
+    new_refresh_token: str,
+    *,
+    env_path: Optional[Path] = None,
+    previous_refresh_token: Optional[str] = None,
+) -> bool:
+    return persist_refresh_token(
+        new_refresh_token,
+        env_key=REFRESH_TOKEN_ENV_KEY,
+        env_path=env_path,
+        previous_refresh_token=previous_refresh_token,
+        label="sandbox",
+    )

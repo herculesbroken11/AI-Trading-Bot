@@ -7,7 +7,7 @@ Safe defaults live here — not only in .env or documentation.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Optional
 
@@ -77,6 +77,15 @@ class Settings:
     max_daily_loss_usd: float = 500.0
     sql_echo: bool = False
     trading_bot_config: str = "config.json"
+    # Market data (production quotes, read-only). Never used for order execution.
+    market_data_provider: str = "tastytrade"
+    market_data_env: str = "production"
+    market_data_read_only: bool = True
+    tastytrade_market_data_client_id: str = field(default="", repr=False)
+    tastytrade_market_data_client_secret: str = field(default="", repr=False)
+    tastytrade_market_data_refresh_token: str = field(default="", repr=False)
+    tastytrade_market_data_scopes: str = "read"
+    market_data_max_quote_age_seconds: float = 60.0
 
     def validate(self) -> None:
         """Enforce Phase 2 trading-safety rules at startup."""
@@ -95,6 +104,11 @@ class Settings:
             raise ConfigurationError(
                 "LIVE_TRADING_ENABLED=true is blocked in Phase 2. "
                 "Live order routing is not implemented or permitted."
+            )
+        if self.market_data_read_only is not True:
+            raise ConfigurationError(
+                "MARKET_DATA_READ_ONLY must be true. Production market data is "
+                "read-only in Phase 2 and can never be used for order execution."
             )
 
     def validate_startup(self) -> None:
@@ -131,6 +145,19 @@ class Settings:
             "tastytrade_refresh_token_configured": bool(self.tastytrade_refresh_token),
             "api_admin_key_configured": bool(self.api_admin_key),
             "database_url_configured": bool(self.database_url),
+            "market_data_provider": self.market_data_provider,
+            "market_data_env": self.market_data_env,
+            "market_data_read_only": self.market_data_read_only,
+            "market_data_scopes": self.tastytrade_market_data_scopes,
+            "tastytrade_market_data_client_id_configured": bool(
+                self.tastytrade_market_data_client_id
+            ),
+            "tastytrade_market_data_client_secret_configured": bool(
+                self.tastytrade_market_data_client_secret
+            ),
+            "tastytrade_market_data_refresh_token_configured": bool(
+                self.tastytrade_market_data_refresh_token
+            ),
         }
 
 
@@ -171,6 +198,16 @@ def load_settings(
         max_daily_loss_usd=_parse_float(os.getenv("MAX_DAILY_LOSS_USD"), 500.0),
         sql_echo=_parse_bool(os.getenv("SQL_ECHO"), False),
         trading_bot_config=_env_str("TRADING_BOT_CONFIG", "config.json"),
+        market_data_provider=_env_str("MARKET_DATA_PROVIDER", "tastytrade").lower(),
+        market_data_env=_env_str("MARKET_DATA_ENV", "production").lower(),
+        market_data_read_only=_parse_bool(os.getenv("MARKET_DATA_READ_ONLY"), True),
+        tastytrade_market_data_client_id=_env_str("TASTYTRADE_MARKET_DATA_CLIENT_ID"),
+        tastytrade_market_data_client_secret=_env_str("TASTYTRADE_MARKET_DATA_CLIENT_SECRET"),
+        tastytrade_market_data_refresh_token=_env_str("TASTYTRADE_MARKET_DATA_REFRESH_TOKEN"),
+        tastytrade_market_data_scopes=_env_str("TASTYTRADE_MARKET_DATA_SCOPES", "read"),
+        market_data_max_quote_age_seconds=_parse_float(
+            os.getenv("MARKET_DATA_MAX_QUOTE_AGE_SECONDS"), 60.0
+        ),
     )
     settings.validate()
     return settings

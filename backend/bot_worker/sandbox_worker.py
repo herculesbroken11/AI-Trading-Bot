@@ -17,7 +17,12 @@ from backend.adapters.broker.sandbox_order_verification import (
 )
 from backend.adapters.broker.tastytrade_sandbox import SandboxApiError, TastytradeSandboxAdapter
 from backend.config.settings import ConfigurationError, Settings, load_settings, reset_settings_cache
-from backend.config.tastytrade_urls import SANDBOX_BASE_URL, assert_sandbox_base_url
+from backend.config.tastytrade_urls import (
+    SANDBOX_BASE_URL,
+    BrokerUrlBlockedError,
+    assert_execution_component,
+    assert_sandbox_base_url,
+)
 from backend.execution.execution_router import ExecutionRouter
 from backend.execution.order_executor import OrderExecutor
 from backend.repositories.account_snapshot_repository import AccountSnapshotRepository
@@ -137,6 +142,10 @@ class SandboxBotWorker:
         repositories: Optional[SandboxWorkerRepositories] = None,
     ) -> None:
         validate_sandbox_worker_settings(settings)
+        try:
+            assert_execution_component(adapter, role="SandboxBotWorker.adapter")
+        except BrokerUrlBlockedError as exc:
+            raise ConfigurationError(str(exc)) from exc
         self._settings = settings
         self._adapter = adapter
         self._risk = risk_engine or RiskEngine()
