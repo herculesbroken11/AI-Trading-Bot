@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Float, Integer, String, Text
 
 from backend.db.base import Base
 
@@ -83,3 +83,52 @@ class AccountSnapshot(Base):
     open_positions_count = Column(Integer, default=0)
     positions_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ShadowSignalLog(Base):
+    """Shadow-mode (observation only) signal decisions and follow-up movement. Never orders."""
+
+    __tablename__ = "shadow_signal_log"
+    __table_args__ = (
+        CheckConstraint("NOT submitted", name="ck_shadow_signal_log_never_submitted"),
+        CheckConstraint("production_execution_blocked", name="ck_shadow_signal_log_production_blocked"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String, nullable=False, index=True)
+    cycle_number = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    decision = Column(String, nullable=False)  # bullish | bearish | skip
+    selected_symbol = Column(String, nullable=True)  # TNA | TZA | null
+    confidence_score = Column(Float, nullable=False, default=0.0)
+    bullish_score = Column(Float, nullable=False, default=0.0)
+    bearish_score = Column(Float, nullable=False, default=0.0)
+    skip_reason = Column(String, nullable=True, index=True)
+    market_regime = Column(String, nullable=True)
+    explanation = Column(Text, nullable=True)
+    quote_age_tna = Column(Float, nullable=True)
+    quote_age_tza = Column(Float, nullable=True)
+    quote_age_iwm = Column(Float, nullable=True)
+    quote_age_spy = Column(Float, nullable=True)
+    quote_age_qqq = Column(Float, nullable=True)
+    tna_mid = Column(Float, nullable=True)
+    tza_mid = Column(Float, nullable=True)
+    iwm_mid = Column(Float, nullable=True)
+    spy_mid = Column(Float, nullable=True)
+    qqq_mid = Column(Float, nullable=True)
+    vix_last = Column(Float, nullable=True)
+    freshness_gate_passed = Column(Boolean, nullable=False, default=False)
+    raw_snapshot_json = Column(Text, nullable=True)
+    raw_score_json = Column(Text, nullable=True)
+    submitted = Column(Boolean, nullable=False, default=False)
+    production_execution_blocked = Column(Boolean, nullable=False, default=True)
+    followup_seconds = Column(Float, nullable=True)
+    tna_mid_after = Column(Float, nullable=True)
+    tza_mid_after = Column(Float, nullable=True)
+    iwm_mid_after = Column(Float, nullable=True)
+    spy_mid_after = Column(Float, nullable=True)
+    qqq_mid_after = Column(Float, nullable=True)
+    selected_symbol_move_pct = Column(Float, nullable=True)
+    iwm_move_pct = Column(Float, nullable=True)
+    direction_was_correct = Column(Boolean, nullable=True)
+    outcome_note = Column(Text, nullable=True)

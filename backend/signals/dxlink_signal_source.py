@@ -41,6 +41,32 @@ def _default_stream_factory(provider: DXLinkQuoteTokenProvider, symbols: List[st
     return DXLinkStreamClient(provider, symbols=symbols)
 
 
+def collect_snapshot_from_dxlink(
+    config: MarketDataConfig,
+    *,
+    symbols: Sequence[str] = DEFAULT_SIGNAL_SYMBOLS,
+    duration_seconds: float = 30.0,
+    max_age_seconds: float = 1.0,
+    provider: Optional[DXLinkQuoteTokenProvider] = None,
+    stream_factory: Optional[StreamFactory] = None,
+) -> Tuple[MarketSnapshot, StreamRunSummary, Dict[str, object]]:
+    """Stream read-only quotes and return the snapshot at the end of the window. Raises MarketDataError."""
+    provider = provider or DXLinkQuoteTokenProvider(config)
+    token = provider.get_token()
+    client = (stream_factory or _default_stream_factory)(provider, list(symbols))
+    try:
+        client.connect()
+        summary = client.stream(duration_seconds, max_age_seconds=max_age_seconds)
+        snapshot = MarketSnapshot.from_stream_state(
+            client.state,
+            now=client.now(),
+            created_at=datetime.now(timezone.utc),
+        )
+    finally:
+        client.disconnect()
+    return snapshot, summary, token.safe_summary()
+
+
 def collect_signal_from_dxlink(
     config: MarketDataConfig,
     *,
@@ -51,28 +77,19 @@ def collect_signal_from_dxlink(
     stream_factory: Optional[StreamFactory] = None,
 ) -> DXLinkSignalResult:
     """Stream read-only quotes, then build one snapshot and one decision. Raises MarketDataError."""
-    provider = provider or DXLinkQuoteTokenProvider(config)
-    token = provider.get_token()
-    client = (stream_factory or _default_stream_factory)(provider, list(symbols))
-    try:
-        client.connect()
-        summary = client.stream(
-            duration_seconds,
-            max_age_seconds=engine.config.max_quote_age_seconds,
-        )
-        now = client.now()
-        snapshot = MarketSnapshot.from_stream_state(
-            client.state,
-            now=now,
-            created_at=datetime.now(timezone.utc),
-        )
-    finally:
-        client.disconnect()
+    snapshot, summary, token_summary = collect_snapshot_from_dxlink(
+        config,
+        symbols=symbols,
+        duration_seconds=duration_seconds,
+        max_age_seconds=engine.config.max_quote_age_seconds,
+        provider=provider,
+        stream_factory=stream_factory,
+    )
     return DXLinkSignalResult(
         decision=engine.decide(snapshot),
         snapshot=snapshot,
         stream_summary=summary,
-        token_summary=token.safe_summary(),
+        token_summary=token_summary,
     )
 
 
