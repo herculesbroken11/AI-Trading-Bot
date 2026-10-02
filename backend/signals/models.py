@@ -102,6 +102,30 @@ class SymbolQuote:
             "diagnostic_only": self.diagnostic_only,
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SymbolQuote":
+        """Inverse of to_dict (derived fields mid/spread_pct are recomputed)."""
+
+        def num(key: str) -> Optional[float]:
+            value = data.get(key)
+            return None if value is None else float(value)
+
+        return cls(
+            symbol=str(data["symbol"]).upper(),
+            bid=num("bid"),
+            ask=num("ask"),
+            last=num("last"),
+            day_open=num("day_open"),
+            day_high=num("day_high"),
+            day_low=num("day_low"),
+            prev_close=num("prev_close"),
+            volume=num("volume"),
+            first_mid=num("first_mid"),
+            quote_age_seconds=num("quote_age_seconds"),
+            quote_updates=int(data.get("quote_updates") or 0),
+            diagnostic_only=bool(data.get("diagnostic_only", False)),
+        )
+
 
 @dataclass
 class MarketSnapshot:
@@ -147,6 +171,17 @@ class MarketSnapshot:
             "created_at": self.created_at.isoformat(),
             "quotes": {symbol: quote.to_dict() for symbol, quote in self.quotes.items()},
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "MarketSnapshot":
+        """Rebuild a stored snapshot (e.g. shadow_signal_log.raw_snapshot_json) for offline replay."""
+        created_raw = data.get("created_at")
+        created_at = datetime.fromisoformat(created_raw) if created_raw else datetime.now(timezone.utc)
+        quotes = {
+            str(symbol).upper(): SymbolQuote.from_dict({**quote, "symbol": quote.get("symbol", symbol)})
+            for symbol, quote in (data.get("quotes") or {}).items()
+        }
+        return cls(quotes=quotes, created_at=created_at, source=str(data.get("source") or "stored"))
 
 
 @dataclass(frozen=True)

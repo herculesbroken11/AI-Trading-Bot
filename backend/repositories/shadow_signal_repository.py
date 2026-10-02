@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from sqlalchemy import inspect
 from sqlalchemy.engine import make_url
@@ -94,10 +94,18 @@ class ShadowSignalRepository:
         self._session.refresh(row)
         return row
 
-    def list_signals(self, *, run_id: Optional[str] = None, limit: int = 100) -> List[ShadowSignalLog]:
+    def list_signals(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        run_ids: Optional[Sequence[str]] = None,
+        limit: int = 100,
+    ) -> List[ShadowSignalLog]:
         query = self._session.query(ShadowSignalLog)
         if run_id:
             query = query.filter(ShadowSignalLog.run_id == run_id)
+        if run_ids:
+            query = query.filter(ShadowSignalLog.run_id.in_(list(run_ids)))
         return (
             query.order_by(ShadowSignalLog.created_at.desc(), ShadowSignalLog.id.desc())
             .limit(max(1, int(limit)))
