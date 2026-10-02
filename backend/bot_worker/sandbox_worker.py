@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.adapters.broker.sandbox_auth import SandboxAuthError
 from backend.adapters.broker.sandbox_rate_limiter import RateLimitInfo, rate_limit_info_from
@@ -200,7 +200,14 @@ class SandboxBotWorker:
         limit_price: Optional[float] = 2.0,
         reference_price: float = 50.0,
         confirm_submit: bool = False,
+        signal_source: str = "manual",
+        market_data_healthy: bool = True,
+        pre_submit_check: Optional[Callable[[], Tuple[bool, str]]] = None,
     ) -> SandboxBotCycleResult:
+        """
+        pre_submit_check runs immediately before a confirmed submit; a False
+        result (or any exception) skips the submit with skipped_market_data_gate.
+        """
         normalized_signal = signal.strip().lower()
         if normalized_signal not in ALLOWED_SIGNALS:
             return SandboxBotCycleResult(
@@ -308,7 +315,7 @@ class SandboxBotWorker:
                 self._log_skipped(skip.decision_status, skip.message, normalized_signal, warnings)
                 return skip
 
-            self._log_strategy_decision(normalized_signal, warnings)
+            self._log_strategy_decision(normalized_signal, warnings, source=signal_source)
 
             if normalized_signal == "none":
                 result = SandboxBotCycleResult(
@@ -330,7 +337,12 @@ class SandboxBotWorker:
             assert symbol is not None
 
             risk_price = float(limit_price if normalized_order_type == "Limit" else reference_price)
-            context = self._build_context(balance, positions_count, risk_price)
+            context = self._build_context(
+                balance,
+                positions_count,
+                risk_price,
+                market_data_healthy=market_data_healthy,
+            )
             intent = OrderIntent(
                 symbol=symbol,
                 side="buy",
@@ -339,7 +351,7 @@ class SandboxBotWorker:
                 order_type=normalized_order_type,
                 limit_price=limit_price if normalized_order_type == "Limit" else None,
                 source=WORKER_SOURCE,
-                reason=f"sandbox worker signal={normalized_signal}",
+                reason=f"sandbox worker signal={normalized_signal} source={signal_source}",
                 current_price=risk_price,
             )
 
@@ -420,6 +432,32 @@ class SandboxBotWorker:
                     warnings=warnings,
                 )
                 return result
+
+            if pre_submit_check is not None:
+                try:
+                    allowed, gate_message = pre_submit_check()
+                except Exception as exc:
+                    allowed, gate_message = False, f"pre-submit check failed: {type(exc).__name__}"
+                if not allowed:
+                    result = SandboxBotCycleResult(
+                        success=True,
+                        decision_status="skipped_market_data_gate",
+                        signal=normalized_signal,
+                        symbol=symbol,
+                        message=f"Submit skipped: {gate_message}",
+                        account_number=account_number,
+                        active_live_orders_count=active_live_count,
+                        positions_count=positions_count,
+                        dry_run_passed=True,
+                        submitted=False,
+                        risk_approved=True,
+                        order_type=normalized_order_type,
+                        limit_price=limit_price,
+                        warnings=warnings,
+                    )
+                    self._log_skipped(result.decision_status, result.message, normalized_signal, warnings)
+                    return result
+                warnings.append(f"pre-submit check: {gate_message}")
 
             execution = self._executor.execute(intent, context)
             broker_order_id = broker_order_id_from_execution(execution.order_id, execution.raw)
@@ -546,7 +584,14 @@ class SandboxBotWorker:
         self._log_skipped(result.decision_status, result.message, signal, warnings)
         return result
 
-    def _build_context(self, balance: dict, positions_count: int, price: float) -> RiskContext:
+    def _build_context(
+        self,
+        balance: dict,
+        positions_count: int,
+        price: float,
+        *,
+        market_data_healthy: bool = True,
+    ) -> RiskContext:
         buying_power = _coerce_balance_amount(balance.get("buying_power"))
         if buying_power is None or buying_power <= 0:
             buying_power = _coerce_balance_amount(balance.get("cash_balance")) or 10_000.0
@@ -561,7 +606,7 @@ class SandboxBotWorker:
             pending_orders_count=0,
             trades_today_count=0,
             daily_pnl=0.0,
-            market_data_healthy=True,
+            market_data_healthy=market_data_healthy,
             max_trades_per_day=3,
             max_daily_loss_usd=self._settings.max_daily_loss_usd,
             buying_power_reserve_pct=0.08,
@@ -649,7 +694,7 @@ class SandboxBotWorker:
         except Exception as exc:
             warnings.append(f"account snapshot logging failed: {type(exc).__name__}")
 
-    def _log_strategy_decision(self, signal: str, warnings: List[str]) -> None:
+    def _log_strategy_decision(self, signal: str, warnings: List[str], *, source: str = "manual") -> None:
         repo = self._repos.decision_repository
         if not repo:
             return
@@ -659,8 +704,8 @@ class SandboxBotWorker:
                 source=WORKER_SOURCE,
                 symbol=map_signal_to_symbol(signal),
                 approved=signal != "none",
-                reason=f"manual signal={signal}",
-                payload={"signal": signal},
+                reason=f"{source} signal={signal}",
+                payload={"signal": signal, "signal_source": source},
             )
         except Exception as exc:
             warnings.append(f"strategy decision logging failed: {type(exc).__name__}")

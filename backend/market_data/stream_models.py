@@ -191,6 +191,9 @@ class SymbolStreamState:
     day_high: Optional[float] = None
     day_low: Optional[float] = None
     prev_close: Optional[float] = None
+    # First valid bid/ask mid seen this session (baseline for short-window momentum).
+    first_mid: Optional[float] = None
+    first_mid_received_at: Optional[float] = None
     quote_updates: int = 0
     trade_updates: int = 0
     summary_updates: int = 0
@@ -280,6 +283,9 @@ class SymbolStreamState:
             self.ask_size = parse_number(event.get("askSize"))
             self.quote_updates += 1
             self.last_quote_received_at = received_at
+            if self.first_mid is None and self.mid is not None:
+                self.first_mid = self.mid
+                self.first_mid_received_at = received_at
         elif event_type == "Trade":
             self.last_price = _keep(self.last_price, event.get("price"))
             self.last_size = _keep(self.last_size, event.get("size"))
