@@ -57,16 +57,36 @@ def is_production_url(url: str) -> bool:
 MARKET_DATA_BASE_URL = PRODUCTION_BASE_URL
 MARKET_DATA_OAUTH_PATH = "/oauth/token"
 MARKET_DATA_QUOTES_PATH = "/market-data/by-type"
+MARKET_DATA_QUOTE_TOKEN_PATH = "/api-quote-tokens"
 MARKET_DATA_ALLOWED_REQUESTS = frozenset(
     {
         ("POST", MARKET_DATA_OAUTH_PATH),
         ("GET", MARKET_DATA_QUOTES_PATH),
+        ("GET", MARKET_DATA_QUOTE_TOKEN_PATH),
     }
 )
+# DXLink streamer hosts returned by /api-quote-tokens (wss only).
+DXLINK_ALLOWED_HOST_SUFFIXES = (".dxfeed.com",)
 
 
 class MarketDataUrlBlockedError(BrokerUrlBlockedError):
     """Raised when a market-data request targets anything other than quote/auth endpoints."""
+
+
+def assert_dxlink_stream_url(url: str) -> None:
+    """DXLink streaming URL must be wss:// on a dxfeed host; anything else fails closed."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit((url or "").strip())
+    host = (parts.hostname or "").lower()
+    if parts.scheme.lower() != "wss":
+        raise MarketDataUrlBlockedError(
+            f"DXLink URL scheme {parts.scheme!r} is not permitted; only wss:// is allowed."
+        )
+    if not host or not any(host.endswith(suffix) for suffix in DXLINK_ALLOWED_HOST_SUFFIXES):
+        raise MarketDataUrlBlockedError(
+            f"DXLink host {host!r} is not permitted; expected a *.dxfeed.com streamer."
+        )
 
 
 class MarketDataCredentialMisuseError(BrokerUrlBlockedError):

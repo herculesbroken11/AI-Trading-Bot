@@ -86,6 +86,8 @@ class Settings:
     tastytrade_market_data_refresh_token: str = field(default="", repr=False)
     tastytrade_market_data_scopes: str = "read"
     market_data_max_quote_age_seconds: float = 60.0
+    # DXLink streaming: quotes older than this are stale and must never be traded on.
+    stream_max_quote_age_seconds: float = 1.0
 
     def validate(self) -> None:
         """Enforce Phase 2 trading-safety rules at startup."""
@@ -149,6 +151,7 @@ class Settings:
             "market_data_env": self.market_data_env,
             "market_data_read_only": self.market_data_read_only,
             "market_data_scopes": self.tastytrade_market_data_scopes,
+            "stream_max_quote_age_seconds": self.stream_max_quote_age_seconds,
             "tastytrade_market_data_client_id_configured": bool(
                 self.tastytrade_market_data_client_id
             ),
@@ -207,6 +210,9 @@ def load_settings(
         tastytrade_market_data_scopes=_env_str("TASTYTRADE_MARKET_DATA_SCOPES", "read"),
         market_data_max_quote_age_seconds=_parse_float(
             os.getenv("MARKET_DATA_MAX_QUOTE_AGE_SECONDS"), 60.0
+        ),
+        stream_max_quote_age_seconds=_parse_float(
+            os.getenv("STREAM_MAX_QUOTE_AGE_SECONDS"), 1.0
         ),
     )
     settings.validate()
