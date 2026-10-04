@@ -11,6 +11,14 @@ from backend.signals.models import MarketSnapshot, SignalDecision, SignalDirecti
 
 TRACKED_SYMBOLS = ("TNA", "TZA", "IWM", "SPY", "QQQ")
 FOLLOWUP_MAX_QUOTE_AGE_SECONDS = 5.0
+SESSION_FIELDS = (
+    "session_label",
+    "session_is_regular_hours",
+    "session_is_near_close",
+    "session_minutes_to_close",
+    "session_guard_passed",
+    "session_guard_reason",
+)
 
 
 class ShadowSafetyError(RuntimeError):
@@ -139,6 +147,12 @@ class ShadowCycleRecord:
     warnings: List[str] = field(default_factory=list)
     followup: Optional[FollowupOutcome] = None
     db_id: Optional[int] = None
+    session_label: Optional[str] = None
+    session_is_regular_hours: Optional[bool] = None
+    session_is_near_close: Optional[bool] = None
+    session_minutes_to_close: Optional[float] = None
+    session_guard_passed: Optional[bool] = None
+    session_guard_reason: Optional[str] = None
     submitted: bool = False
     production_execution_blocked: bool = True
 
@@ -190,6 +204,11 @@ class ShadowCycleRecord:
     def apply_followup(self, outcome: FollowupOutcome) -> None:
         self.followup = outcome
 
+    def apply_session(self, fields: Dict[str, Any]) -> None:
+        """Attach market-session metadata (SessionGuardDecision.record_fields())."""
+        for name in SESSION_FIELDS:
+            setattr(self, name, fields.get(name))
+
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
             "id": self.db_id,
@@ -208,6 +227,7 @@ class ShadowCycleRecord:
             **{f"{s.lower()}_mid": self.mids.get(s) for s in TRACKED_SYMBOLS},
             "vix_last": self.vix_last,
             "freshness_gate_passed": self.freshness_gate_passed,
+            **{name: getattr(self, name) for name in SESSION_FIELDS},
             "submitted": self.submitted,
             "production_execution_blocked": self.production_execution_blocked,
             "warnings": list(self.warnings),
@@ -247,6 +267,8 @@ class ShadowRunSummary:
     errors: List[ShadowCycleError] = field(default_factory=list)
     aborted: bool = False
     abort_reason: Optional[str] = None
+    session_blocked: bool = False
+    session_block_reason: Optional[str] = None
     orders_submitted: int = 0
 
     @property
@@ -260,6 +282,8 @@ class ShadowRunSummary:
             "cycles_completed": self.cycles_completed,
             "aborted": self.aborted,
             "abort_reason": self.abort_reason,
+            "session_blocked": self.session_blocked,
+            "session_block_reason": self.session_block_reason,
             "orders_submitted": self.orders_submitted,
             "errors": [e.to_dict() for e in self.errors],
         }

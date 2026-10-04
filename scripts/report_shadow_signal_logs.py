@@ -6,6 +6,9 @@ Summarises shadow_signal_log rows: decision counts, skip reasons, average
 confidence and quote ages, simple follow-up direction stats, latest decisions.
 Diagnostic only — not a profit calculation.
 
+Checkpoint 2.14: breakdown by session_label, market_window_quality (good / weak /
+bad) and --exclude-bad-session-windows.
+
 Exit codes:
   0 report printed (also when there are no rows)
   2 configuration / database unavailable
@@ -17,7 +20,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -25,7 +28,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from backend.config.settings import ConfigurationError, Settings, load_settings, reset_settings_cache
 from backend.shadow_mode.models import TRACKED_SYMBOLS
-from backend.shadow_mode.report import summarize_shadow_logs
+from backend.shadow_mode.report import row_to_dict, summarize_shadow_logs
+from backend.shadow_mode.session_quality import split_bad_session_windows
 
 CONFIG_EXIT_CODE = 2
 LATEST_IN_TEXT = 10
@@ -78,6 +82,16 @@ def _print_report(report: Dict[str, Any], *, run_id: Optional[str], limit: int) 
             f"avg_iwm_move_pct={_num(stats['avg_iwm_move_pct'], '{:+.4f}')}"
         )
     print(f"skip_avg_iwm_move_pct: {_num(outcomes['skip_avg_iwm_move_pct'], '{:+.4f}')}")
+    print("--- session breakdown ---")
+    for label, s in report["session_breakdown"].items():
+        print(
+            f"{label}: cycles={s['cycles']} fresh={_num(s['freshness_pass_pct'])}% "
+            f"stale_skips={s['stale_skip_count']} avg_quote_age={_num(s['avg_quote_age_seconds'], '{:.3f}')}s "
+            f"quality={s['window_quality']}"
+        )
+    quality = report["market_window_quality"]
+    print(f"market_window_quality: {quality['market_window_quality']}")
+    print("quality_reasons: " + "; ".join(quality["reasons"]))
     print(f"submitted_count: {report['submitted_count']}")
     print(f"production_execution_blocked_all: {str(report['production_execution_blocked_all']).lower()}")
 
@@ -100,20 +114,44 @@ def run_report(
     run_id: Optional[str] = None,
     limit: int = 100,
     json_output: bool = False,
+    exclude_bad_session_windows: bool = False,
     rows_loader: Optional[RowsLoader] = None,
 ) -> int:
     if limit < 1:
         return _error("--limit must be >= 1", json_output)
     try:
-        rows = list((rows_loader or _default_rows_loader)(settings, run_id, limit))
+        rows = [row_to_dict(r) for r in (rows_loader or _default_rows_loader)(settings, run_id, limit)]
     except Exception as exc:
         message = str(exc) if "alembic upgrade" in str(exc) else f"database unavailable ({type(exc).__name__})"
         return _error(message, json_output, next_step="check DATABASE_URL; run: alembic upgrade head")
 
+    rows_before = len(rows)
+    excluded: List[Dict[str, Any]] = []
+    if exclude_bad_session_windows:
+        rows, excluded = split_bad_session_windows(rows)
+
     report = summarize_shadow_logs(rows, latest=limit)
     if json_output:
-        print(json.dumps({"run_id": run_id, "limit": limit, "report": report}, indent=2, sort_keys=True, default=str))
+        doc = {
+            "run_id": run_id,
+            "limit": limit,
+            "exclude_bad_session_windows": exclude_bad_session_windows,
+            "rows_before_exclusion": rows_before,
+            "excluded_session_windows": excluded,
+            "report": report,
+        }
+        print(json.dumps(doc, indent=2, sort_keys=True, default=str))
     else:
+        if exclude_bad_session_windows:
+            print("--- excluded bad session windows ---")
+            print(f"rows_before_exclusion: {rows_before}  rows_after_exclusion: {len(rows)}")
+            if not excluded:
+                print("excluded_windows: none")
+            for w in excluded:
+                print(
+                    f"excluded: run={w['run_id']} session={w['session_label']} cycles={w['cycles']} "
+                    f"fresh={_num(w['freshness_pass_pct'])}% reason={'; '.join(w['reasons'])}"
+                )
         _print_report(report, run_id=run_id, limit=limit)
     return 0
 
@@ -133,6 +171,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--exclude-bad-session-windows",
+        action="store_true",
+        help="drop after-hours / weekend / pre-market windows and windows with freshness < 70%%",
+    )
     args = parser.parse_args(argv)
 
     reset_settings_cache()
@@ -140,7 +183,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         settings = load_settings(env_path=_REPO_ROOT / ".env", override=True)
     except ConfigurationError as exc:
         return _error(str(exc), args.json)
-    return run_report(settings, run_id=args.run_id, limit=args.limit, json_output=args.json)
+    return run_report(
+        settings,
+        run_id=args.run_id,
+        limit=args.limit,
+        json_output=args.json,
+        exclude_bad_session_windows=args.exclude_bad_session_windows,
+    )
 
 
 if __name__ == "__main__":

@@ -543,7 +543,8 @@ def test_migration_003_creates_matching_table():
             mod.upgrade()
             mod.upgrade()  # idempotent
         columns = {c["name"] for c in sa_inspect(conn).get_columns("shadow_signal_log")}
-    assert columns == set(ShadowSignalLog.__table__.columns.keys())
+    # Session metadata columns are added by migration 004 (Checkpoint 2.14).
+    assert columns == set(ShadowSignalLog.__table__.columns.keys()) - set(models_mod.SESSION_FIELDS)
 
 
 def test_open_shadow_repository_creates_or_requires_table(tmp_path):

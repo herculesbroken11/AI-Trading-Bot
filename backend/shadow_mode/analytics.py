@@ -18,7 +18,12 @@ import json
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from backend.shadow_mode.models import TRACKED_SYMBOLS, ShadowCycleRecord, pct_move
+from backend.shadow_mode.models import SESSION_FIELDS, TRACKED_SYMBOLS, ShadowCycleRecord, pct_move
+from backend.shadow_mode.session_quality import (
+    effective_session_label,
+    overall_market_window_quality,
+    session_breakdown,
+)
 from backend.signals.models import MarketSnapshot, SignalDirection
 from backend.signals.tna_tza_signal_engine import SignalEngineConfig, TnaTzaSignalEngine
 
@@ -58,6 +63,7 @@ _FIELDS = (
     "raw_score_json",
     "submitted",
     "production_execution_blocked",
+    *SESSION_FIELDS,
     *(f"quote_age_{s.lower()}" for s in TRACKED_SYMBOLS),
     *(f"{s.lower()}_mid" for s in TRACKED_SYMBOLS),
     *(f"{s.lower()}_mid_after" for s in TRACKED_SYMBOLS),
@@ -194,6 +200,12 @@ def _diagnosis(summary: Mapping[str, Any]) -> str:
     profile = summary["score_profile"]
     if data_quality / total > 0.5:
         return "mostly data-quality skips (stale/missing quotes); fix freshness before judging thresholds"
+    quality = summary.get("market_window_quality") or {}
+    if quality.get("market_window_quality") == "bad":
+        return (
+            "poor collection window (" + "; ".join(quality.get("reasons") or []) + "); "
+            "collect during recommended regular-hours windows before tuning"
+        )
     if window == "flat/choppy":
         return "market window was flat/choppy; skips are expected — collect data during stronger movement"
     if threshold_skips and profile["near_miss_cycles"] >= max(1, threshold_skips // 2):
@@ -212,6 +224,7 @@ def analyze_rows(rows: Sequence[Mapping[str, Any]], *, min_move_pct: float = DEF
         skip_reasons[key] = skip_reasons.get(key, 0) + 1
 
     skip_moves = {s: [followup_move(r, s) for r in skips] for s in ("IWM", "TNA", "TZA")}
+    market_window = analyze_market_window(rows, min_move_pct=min_move_pct)
     summary: Dict[str, Any] = {
         "total_cycles": len(rows),
         "run_ids": sorted({str(r.get("run_id")) for r in rows if r.get("run_id")}),
@@ -231,7 +244,11 @@ def analyze_rows(rows: Sequence[Mapping[str, Any]], *, min_move_pct: float = DEF
                 1 for m in skip_moves["IWM"] if m is not None and abs(m) >= min_move_pct
             ),
         },
-        "market_window": analyze_market_window(rows, min_move_pct=min_move_pct),
+        "market_window": market_window,
+        "session_breakdown": session_breakdown(rows),
+        "market_window_quality": overall_market_window_quality(
+            rows, market_window_status=market_window["market_window_status"]
+        ),
         "score_profile": _score_profile(rows),
         "submitted_count": sum(1 for r in rows if r.get("submitted")),
     }
@@ -246,6 +263,10 @@ def compare_runs(rows: Sequence[Mapping[str, Any]], *, min_move_pct: float = DEF
     out = []
     for run_id, group in sorted(by_run.items(), key=lambda kv: kv[1][0].get("created_at") or ""):
         stats = analyze_rows(group, min_move_pct=min_move_pct)
+        labels: Dict[str, int] = {}
+        for r in group:
+            label, _source = effective_session_label(r)
+            labels[label] = labels.get(label, 0) + 1
         out.append(
             {
                 "run_id": run_id,
@@ -256,6 +277,8 @@ def compare_runs(rows: Sequence[Mapping[str, Any]], *, min_move_pct: float = DEF
                 "freshness_pass_pct": stats["freshness_pass_pct"],
                 "avg_abs_iwm_move_pct": stats["market_window"]["avg_abs_iwm_move_pct"],
                 "market_window_status": stats["market_window"]["market_window_status"],
+                "market_window_quality": stats["market_window_quality"]["market_window_quality"],
+                "session_labels": labels,
                 "near_miss_cycles": stats["score_profile"]["near_miss_cycles"],
             }
         )

@@ -4,16 +4,37 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
-from sqlalchemy import inspect
-from sqlalchemy.engine import make_url
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session
 
 from backend.db.models import ShadowSignalLog
-from backend.shadow_mode.models import TRACKED_SYMBOLS, FollowupOutcome, ShadowCycleRecord
+from backend.shadow_mode.models import SESSION_FIELDS, TRACKED_SYMBOLS, FollowupOutcome, ShadowCycleRecord
 
 
 class ShadowTableMissingError(RuntimeError):
     pass
+
+
+def missing_session_columns(engine: Engine) -> List[str]:
+    table = ShadowSignalLog.__tablename__
+    existing = {col["name"] for col in inspect(engine).get_columns(table)}
+    return [name for name in SESSION_FIELDS if name not in existing]
+
+
+def add_missing_session_columns(engine: Engine) -> List[str]:
+    """Same nullable columns as migration 004_shadow_session_metadata; existing rows keep NULLs."""
+    missing = missing_session_columns(engine)
+    table = ShadowSignalLog.__table__
+    with engine.begin() as conn:
+        for name in missing:
+            column_type = table.columns[name].type.compile(dialect=engine.dialect)
+            conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {name} {column_type}"))
+        if "session_label" in missing:
+            conn.execute(
+                text(f"CREATE INDEX IF NOT EXISTS ix_{table.name}_session_label ON {table.name} (session_label)")
+            )
+    return missing
 
 
 def safe_database_label(database_url: str) -> str:
@@ -26,9 +47,10 @@ def safe_database_label(database_url: str) -> str:
 
 def open_shadow_repository(database_url: str, *, create_table: bool, sql_echo: bool = False) -> "ShadowSignalRepository":
     """
-    create_table=True creates only shadow_signal_log if missing (non-destructive;
-    migration 003_shadow_signal_log skips existing tables). False raises
-    ShadowTableMissingError instead.
+    create_table=True creates only shadow_signal_log if missing and adds any
+    missing nullable session columns (non-destructive; migrations 003/004 skip
+    what already exists). False never changes the schema and raises
+    ShadowTableMissingError instead (read-only report / analytics path).
     """
     from backend.db.session import configure_engine, get_db_session, get_engine
 
@@ -40,6 +62,13 @@ def open_shadow_repository(database_url: str, *, create_table: bool, sql_echo: b
                 "shadow_signal_log table not found; run: alembic upgrade head"
             )
         ShadowSignalLog.__table__.create(bind=engine, checkfirst=True)
+    elif missing_session_columns(engine):
+        if not create_table:
+            raise ShadowTableMissingError(
+                "shadow_signal_log is missing session metadata columns "
+                "(migration 004_shadow_session_metadata); run: alembic upgrade head"
+            )
+        add_missing_session_columns(engine)
     return ShadowSignalRepository(get_db_session())
 
 
@@ -71,6 +100,8 @@ class ShadowSignalRepository:
         for symbol in TRACKED_SYMBOLS:
             setattr(row, f"quote_age_{symbol.lower()}", record.quote_ages.get(symbol))
             setattr(row, f"{symbol.lower()}_mid", record.mids.get(symbol))
+        for name in SESSION_FIELDS:
+            setattr(row, name, getattr(record, name))
         self._session.add(row)
         self._session.commit()
         self._session.refresh(row)

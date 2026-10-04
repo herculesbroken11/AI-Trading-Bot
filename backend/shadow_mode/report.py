@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from backend.shadow_mode.models import TRACKED_SYMBOLS
+from backend.shadow_mode.models import SESSION_FIELDS, TRACKED_SYMBOLS
+from backend.shadow_mode.session_quality import overall_market_window_quality, session_breakdown
 
 DATA_QUALITY_SKIPS = frozenset({"stale_market_data", "missing_required_quote"})
 UNCLEAR_SKIPS = frozenset({"unclear_market_direction"})
@@ -31,6 +32,7 @@ _ROW_FIELDS = (
     "iwm_move_pct",
     "direction_was_correct",
     "outcome_note",
+    *SESSION_FIELDS,
     *(f"quote_age_{s.lower()}" for s in TRACKED_SYMBOLS),
     *(f"{s.lower()}_mid" for s in TRACKED_SYMBOLS),
 )
@@ -112,6 +114,8 @@ def summarize_shadow_logs(rows: Iterable[Any], *, latest: int = 10) -> Dict[str,
             "bearish": outcome_for("bearish"),
             "skip_avg_iwm_move_pct": _avg((d.get("iwm_move_pct") for d in skips), 4),
         },
+        "session_breakdown": session_breakdown(items),
+        "market_window_quality": overall_market_window_quality(items),
         "submitted_count": sum(1 for d in items if d.get("submitted")),
         "production_execution_blocked_all": all(d.get("production_execution_blocked") is not False for d in items),
         "latest_decisions": items[: max(0, latest)],

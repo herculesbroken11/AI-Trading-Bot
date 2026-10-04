@@ -8,6 +8,10 @@ replays stored snapshots through the Signal Engine under alternative SAFE
 thresholds. Hypothetical results are never written back, never applied to live
 or sandbox settings, and nothing here can place an order. Secrets are never printed.
 
+Checkpoint 2.14: per-session breakdown (regular_hours / near_close / after_hours
+...), market_window_quality (good / weak / bad) and --exclude-bad-session-windows
+to drop after-hours, weekend, pre-market and poorly fresh windows before analysis.
+
 Exit codes:
   0 analysis printed (also when there are no rows)
   2 configuration / database / unsafe arguments
@@ -41,6 +45,7 @@ from backend.shadow_mode.analytics import (
 )
 from backend.shadow_mode.models import TRACKED_SYMBOLS
 from backend.shadow_mode.runner import production_execution_block_checks
+from backend.shadow_mode.session_quality import split_bad_session_windows
 
 CONFIG_EXIT_CODE = 2
 MAX_LIMIT = 10000
@@ -108,18 +113,49 @@ def _print_analysis(analysis: Dict[str, Any]) -> None:
         f"avg_score_gap: {_num(profile['avg_score_gap'])}  near_miss_cycles (within 10 of entry "
         f"{_num(profile['stored_entry_threshold'])}): {profile['near_miss_cycles']}"
     )
+    print_session_quality(analysis)
     print(f"diagnosis: {analysis['diagnosis']}")
+
+
+def print_session_quality(analysis: Dict[str, Any]) -> None:
+    print("--- session breakdown ---")
+    for label, s in analysis["session_breakdown"].items():
+        d = s["decisions"]
+        sources = ",".join(f"{k}={v}" for k, v in sorted(s["label_sources"].items()))
+        print(
+            f"{label}: cycles={s['cycles']} bull={d['bullish']} bear={d['bearish']} skip={d['skip']} "
+            f"fresh={_num(s['freshness_pass_pct'])}% stale_skips={s['stale_skip_count']} "
+            f"avg_quote_age={_num(s['avg_quote_age_seconds'], '{:.3f}')}s quality={s['window_quality']} "
+            f"(label source: {sources})"
+        )
+    quality = analysis["market_window_quality"]
+    print(f"market_window_quality: {quality['market_window_quality']}")
+    print("quality_reasons: " + "; ".join(quality["reasons"]))
+
+
+def print_excluded_windows(excluded: List[Dict[str, Any]], rows_before: int, rows_after: int) -> None:
+    print("--- excluded bad session windows ---")
+    print(f"rows_before_exclusion: {rows_before}  rows_after_exclusion: {rows_after}")
+    if not excluded:
+        print("excluded_windows: none")
+    for w in excluded:
+        print(
+            f"excluded: run={w['run_id']} session={w['session_label']} cycles={w['cycles']} "
+            f"fresh={_num(w['freshness_pass_pct'])}% stale_skips={w['stale_skip_count']} "
+            f"reason={'; '.join(w['reasons'])}"
+        )
 
 
 def _print_comparison(runs: List[Dict[str, Any]]) -> None:
     print("--- run comparison ---")
     for run in runs:
         d = run["decisions"]
+        sessions = ",".join(f"{k}={v}" for k, v in run["session_labels"].items())
         print(
             f"{run['run_id']}: cycles={run['cycles']} bull={d['bullish']} bear={d['bearish']} skip={d['skip']} "
             f"top_skip={run['top_skip_reason'] or '-'} fresh={_num(run['freshness_pass_pct'])}% "
             f"avg_abs_iwm={_num(run['avg_abs_iwm_move_pct'], '{:.4f}')}% window={run['market_window_status']} "
-            f"near_miss={run['near_miss_cycles']}"
+            f"quality={run['market_window_quality']} sessions={sessions} near_miss={run['near_miss_cycles']}"
         )
 
 
@@ -172,6 +208,7 @@ def run_analysis(
     max_opposing: str = "30,40,50",
     min_score_gap: str = "10,15,20",
     min_followup_move_pct: float = DEFAULT_MIN_FOLLOWUP_MOVE_PCT,
+    exclude_bad_session_windows: bool = False,
     rows_loader: Optional[RowsLoader] = None,
 ) -> int:
     try:
@@ -211,6 +248,13 @@ def run_analysis(
     if len(rows) >= limit:
         warnings.append(f"row limit {limit} reached; older rows were not analysed")
 
+    rows_before = len(rows)
+    excluded: List[Dict[str, Any]] = []
+    if exclude_bad_session_windows:
+        rows, excluded = split_bad_session_windows(rows)
+        if rows_before and not rows:
+            warnings.append("every window was rated bad; nothing left to analyse")
+
     analysis = analyze_rows(rows, min_move_pct=min_followup_move_pct)
     comparison = compare_runs(rows, min_move_pct=min_followup_move_pct)
     simulation = (
@@ -239,6 +283,10 @@ def run_analysis(
             "execution": execution,
             "run_ids": run_ids,
             "limit": limit,
+            "exclude_bad_session_windows": exclude_bad_session_windows,
+            "rows_before_exclusion": rows_before,
+            "rows_after_exclusion": len(rows),
+            "excluded_session_windows": excluded,
             "analysis": analysis,
             "run_comparison": comparison,
             "threshold_simulation": simulation,
@@ -254,8 +302,11 @@ def run_analysis(
     print("production_order_execution: blocked")
     print(f"run_ids: {','.join(run_ids) if run_ids else 'latest rows (all runs)'}")
     print(f"limit: {limit}")
+    print(f"exclude_bad_session_windows: {str(exclude_bad_session_windows).lower()}")
     for warning in warnings:
         print(f"warning: {warning}")
+    if exclude_bad_session_windows:
+        print_excluded_windows(excluded, rows_before, len(rows))
     _print_analysis(analysis)
     _print_comparison(comparison)
     if simulation is not None:
@@ -281,6 +332,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-opposing", default="30,40,50")
     parser.add_argument("--min-score-gap", default="10,15,20")
     parser.add_argument("--min-followup-move-pct", type=float, default=DEFAULT_MIN_FOLLOWUP_MOVE_PCT)
+    parser.add_argument(
+        "--exclude-bad-session-windows",
+        action="store_true",
+        help="drop after-hours / weekend / pre-market windows and windows with freshness < 70%%",
+    )
     args = parser.parse_args(argv)
 
     reset_settings_cache()
@@ -298,6 +354,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_opposing=args.max_opposing,
         min_score_gap=args.min_score_gap,
         min_followup_move_pct=args.min_followup_move_pct,
+        exclude_bad_session_windows=args.exclude_bad_session_windows,
     )
 
 

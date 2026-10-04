@@ -132,3 +132,10 @@ class ShadowSignalLog(Base):
     iwm_move_pct = Column(Float, nullable=True)
     direction_was_correct = Column(Boolean, nullable=True)
     outcome_note = Column(Text, nullable=True)
+    # Market session metadata (migration 004); NULL on rows logged before 2.14.
+    session_label = Column(String, nullable=True, index=True)
+    session_is_regular_hours = Column(Boolean, nullable=True)
+    session_is_near_close = Column(Boolean, nullable=True)
+    session_minutes_to_close = Column(Float, nullable=True)
+    session_guard_passed = Column(Boolean, nullable=True)
+    session_guard_reason = Column(Text, nullable=True)

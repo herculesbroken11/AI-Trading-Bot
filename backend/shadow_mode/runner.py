@@ -4,6 +4,8 @@ Shadow mode runner (Checkpoint 2.12): bounded, manual, observation only.
 Runs a fixed number of cycles (hard cap MAX_CYCLES; no daemon, no infinite
 loop). Each cycle: stream read-only DXLink data -> one Signal Engine decision
 -> log it -> optionally stream a follow-up window and record market movement.
+Checkpoint 2.14: an optional market session guard labels every cycle and, in
+enforce mode, stops the run before a cycle that would start in a poor window.
 This module has no broker, order or execution dependency and cannot submit orders.
 """
 
@@ -12,7 +14,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from backend.config.settings import ConfigurationError, Settings
@@ -25,6 +27,7 @@ from backend.config.tastytrade_urls import (
 from backend.market_data.config import MarketDataConfig, validate_market_data_settings
 from backend.market_data.dxlink_stream import DXLinkQuoteTokenProvider
 from backend.market_data.tastytrade_market_data import MarketDataError
+from backend.market_session import MarketSessionGuard, SessionGuardDecision, get_session_status
 from backend.shadow_mode.logger import ShadowSignalLogger
 from backend.shadow_mode.models import (
     FOLLOWUP_MAX_QUOTE_AGE_SECONDS,
@@ -99,16 +102,8 @@ def validate_shadow_environment(settings: Settings) -> MarketDataConfig:
 
 
 def is_regular_market_hours(now: Optional[datetime] = None) -> Optional[bool]:
-    """US equities regular session (Mon-Fri 09:30-16:00 ET; holidays ignored). None if tz data unavailable."""
-    try:
-        from zoneinfo import ZoneInfo
-
-        eastern = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
-    except Exception:
-        return None
-    if eastern.weekday() >= 5:
-        return False
-    return dtime(9, 30) <= eastern.time() < dtime(16, 0)
+    """US equities regular session (Mon-Fri 09:30-16:00 ET; holidays not known yet)."""
+    return get_session_status(now).is_regular_hours
 
 
 def new_run_id(now: Optional[datetime] = None) -> str:
@@ -142,6 +137,15 @@ class ShadowRunConfig:
             raise ConfigurationError("Invalid shadow run config: " + "; ".join(problems))
         return self
 
+    @property
+    def seconds_per_cycle(self) -> float:
+        """Time one cycle needs before the close: signal window + follow-up + pause."""
+        return float(self.signal_duration_seconds + self.followup_seconds + self.pause_seconds)
+
+    @property
+    def estimated_run_seconds(self) -> float:
+        return self.seconds_per_cycle * self.cycles - self.pause_seconds
+
 
 class ShadowModeRunner:
     """Bounded observation loop. Holds no executor, router or broker adapter."""
@@ -160,6 +164,7 @@ class ShadowModeRunner:
         stream_factory: Optional[StreamFactory] = None,
         sleep: Callable[[float], None] = time.sleep,
         on_event: Optional[EventHandler] = None,
+        session_guard: Optional[MarketSessionGuard] = None,
     ) -> None:
         self._config = market_data_config
         self._engine = engine
@@ -170,6 +175,7 @@ class ShadowModeRunner:
         self._stream_factory = stream_factory
         self._sleep = sleep
         self._on_event = on_event or (lambda _kind, _payload: None)
+        self._session_guard = session_guard
 
     def _provider_or_default(self) -> DXLinkQuoteTokenProvider:
         if self._provider is None:
@@ -191,6 +197,9 @@ class ShadowModeRunner:
         symbols: Sequence[str] = self._run.symbols
         for cycle in range(1, self._run.cycles + 1):
             self._on_event("cycle_start", {"cycle": cycle, "cycles": self._run.cycles})
+            session = self._check_session(summary, cycle)
+            if session is not None and session.blocked:
+                break
             try:
                 result = collect_signal_from_dxlink(
                     self._config,
@@ -212,6 +221,8 @@ class ShadowModeRunner:
                 decision=result.decision,
                 snapshot=result.snapshot,
             )
+            if session is not None:
+                record.apply_session(session.record_fields())
             self._logger.log(record)
             summary.records.append(record)
             self._on_event("decision", {"record": record, "decision": result.decision})
@@ -221,6 +232,17 @@ class ShadowModeRunner:
                     break
             self._pause(cycle)
         return summary
+
+    def _check_session(self, summary: ShadowRunSummary, cycle: int) -> Optional[SessionGuardDecision]:
+        if self._session_guard is None:
+            return None
+        decision = self._session_guard.check(self._run.seconds_per_cycle)
+        self._on_event("session", {"cycle": cycle, "session": decision})
+        if decision.blocked:
+            summary.session_blocked = True
+            summary.session_block_reason = decision.reason
+            self._on_event("session_blocked", {"cycle": cycle, "session": decision})
+        return decision
 
     def _followup(self, summary: ShadowRunSummary, cycle: int, record: ShadowCycleRecord) -> bool:
         """Returns False if a fatal error means the run must stop."""
