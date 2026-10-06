@@ -122,6 +122,14 @@ def _print_record(out: _Output, record: ShadowCycleRecord) -> None:
         + " ".join(f"{s}={_num(record.mids.get(s), '{:.4f}')}" for s in TRACKED_SYMBOLS)
         + f" VIX={_num(record.vix_last)}"
     )
+    quality = (json.loads(record.raw_score_json or "{}") or {}).get("quality") or {}
+    if quality.get("evaluated"):
+        out.line(
+            f"quality: gate_passed={str(quality.get('quality_gate_passed')).lower()} "
+            f"reason={quality.get('quality_gate_reason') or '-'} "
+            f"continuation={_num(quality.get('continuation_score'))} confirmation={_num(quality.get('confirmation_score'))} "
+            f"chop_risk={_num(quality.get('chop_risk_score'))} pullback_risk={_num(quality.get('pullback_risk_score'))}"
+        )
     out.line(f"explanation: {record.explanation}")
     out.line(f"logged: {'db id=' + str(record.db_id) if record.db_id is not None else 'memory only'}")
     out.line("submitted: false (shadow mode never submits orders)")

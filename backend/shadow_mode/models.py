@@ -194,7 +194,12 @@ class ShadowCycleRecord:
             freshness_gate_passed=decision.freshness_gate_passed,
             raw_snapshot_json=json.dumps(snapshot.to_dict(), sort_keys=True, default=str),
             raw_score_json=json.dumps(
-                {"score_breakdown": breakdown, "thresholds": dict(decision.thresholds)},
+                {
+                    "score_breakdown": breakdown,
+                    "thresholds": dict(decision.thresholds),
+                    "quality": decision.quality.to_dict(),
+                    "engine_version": decision.engine_version,
+                },
                 sort_keys=True,
                 default=str,
             ),

@@ -1,4 +1,4 @@
-"""Signal Engine v1 models (Checkpoint 2.11). Signal generation only — never orders."""
+"""Signal Engine models (Checkpoint 2.11; quality gates 2.15). Signal generation only — never orders."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from backend.market_data.stream_models import StreamState
 
 REQUIRED_SIGNAL_SYMBOLS = ("TNA", "TZA", "IWM", "SPY", "QQQ")
 VOLATILITY_SYMBOL = "VIX"
+SIGNAL_ENGINE_VERSION = "v2_quality_gates"
 
 
 class SignalDirection(str, Enum):
@@ -37,6 +38,21 @@ class SignalReason(str, Enum):
     BROAD_MARKET_DISAGREEMENT = "broad_market_disagreement"
     UNCLEAR_MARKET_DIRECTION = "unclear_market_direction"
     INSUFFICIENT_SIGNAL_STRENGTH = "insufficient_signal_strength"
+    # Quality gates (2.15): applied only to a TNA/TZA candidate that already passed the thresholds.
+    WEAK_CONTINUATION = "weak_continuation"
+    CHOPPY_CONFIRMATION = "choppy_confirmation"
+    PULLBACK_RISK = "pullback_risk"
+    OVEREXTENDED_OR_STALLING = "overextended_or_stalling"
+
+
+QUALITY_GATE_REASONS = frozenset(
+    {
+        SignalReason.WEAK_CONTINUATION,
+        SignalReason.CHOPPY_CONFIRMATION,
+        SignalReason.PULLBACK_RISK,
+        SignalReason.OVEREXTENDED_OR_STALLING,
+    }
+)
 
 
 def _round(value: Optional[float], digits: int = 4) -> Optional[float]:
@@ -58,6 +74,8 @@ class SymbolQuote:
     quote_age_seconds: Optional[float] = None
     quote_updates: int = 0
     diagnostic_only: bool = False
+    window_high_mid: Optional[float] = None
+    window_low_mid: Optional[float] = None
 
     @property
     def has_quote(self) -> bool:
@@ -96,6 +114,8 @@ class SymbolQuote:
             "prev_close": self.prev_close,
             "volume": self.volume,
             "first_mid": _round(self.first_mid),
+            "window_high_mid": _round(self.window_high_mid),
+            "window_low_mid": _round(self.window_low_mid),
             "spread_pct": _round(self.spread_pct),
             "quote_age_seconds": _round(self.quote_age_seconds, 3),
             "quote_updates": self.quote_updates,
@@ -124,6 +144,8 @@ class SymbolQuote:
             quote_age_seconds=num("quote_age_seconds"),
             quote_updates=int(data.get("quote_updates") or 0),
             diagnostic_only=bool(data.get("diagnostic_only", False)),
+            window_high_mid=num("window_high_mid"),
+            window_low_mid=num("window_low_mid"),
         )
 
 
@@ -162,6 +184,8 @@ class MarketSnapshot:
                 quote_age_seconds=sym.quote_age_seconds(now),
                 quote_updates=sym.quote_updates if not sym.diagnostic_only else sym.total_updates,
                 diagnostic_only=sym.diagnostic_only,
+                window_high_mid=sym.window_high_mid,
+                window_low_mid=sym.window_low_mid,
             )
         return cls(quotes=quotes, created_at=created_at or datetime.now(timezone.utc))
 
@@ -253,6 +277,65 @@ class SignalScoreBreakdown:
         }
 
 
+@dataclass(frozen=True)
+class SignalQuality:
+    """
+    Quality-gate diagnostics. Scores are 0-100 and measured for `direction`
+    (the TNA/TZA candidate, or the direction the scores lean towards).
+    quality_gate_passed is True only for a candidate that passed every gate;
+    quality_gate_reason is None when passed, otherwise a short code:
+    a gate reason (weak_continuation, ...), "no_candidate" or "not_evaluated".
+    """
+
+    evaluated: bool
+    direction: Optional[str]
+    continuation_score: Optional[float]
+    confirmation_score: Optional[float]
+    chop_risk_score: Optional[float]
+    pullback_risk_score: Optional[float]
+    quality_gate_passed: bool
+    quality_gate_reason: Optional[str]
+    confidence_penalty: float = 0.0
+    metrics: Mapping[str, Optional[float]] = field(default_factory=dict)
+
+    @classmethod
+    def not_evaluated(cls) -> "SignalQuality":
+        return cls(
+            evaluated=False,
+            direction=None,
+            continuation_score=None,
+            confirmation_score=None,
+            chop_risk_score=None,
+            pullback_risk_score=None,
+            quality_gate_passed=False,
+            quality_gate_reason="not_evaluated",
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "evaluated": self.evaluated,
+            "direction": self.direction,
+            "continuation_score": self.continuation_score,
+            "confirmation_score": self.confirmation_score,
+            "chop_risk_score": self.chop_risk_score,
+            "pullback_risk_score": self.pullback_risk_score,
+            "quality_gate_passed": self.quality_gate_passed,
+            "quality_gate_reason": self.quality_gate_reason,
+            "confidence_penalty": self.confidence_penalty,
+            "metrics": {k: _round(v) for k, v in self.metrics.items()},
+        }
+
+
+QUALITY_FIELDS = (
+    "continuation_score",
+    "confirmation_score",
+    "chop_risk_score",
+    "pullback_risk_score",
+    "quality_gate_passed",
+    "quality_gate_reason",
+)
+
+
 @dataclass
 class SignalDecision:
     """One TNA / TZA / SKIP decision. Diagnostic in this checkpoint — never an order."""
@@ -271,6 +354,8 @@ class SignalDecision:
     score_breakdown: Optional[SignalScoreBreakdown] = None
     warnings: List[str] = field(default_factory=list)
     thresholds: Mapping[str, float] = field(default_factory=dict)
+    quality: SignalQuality = field(default_factory=SignalQuality.not_evaluated)
+    engine_version: str = SIGNAL_ENGINE_VERSION
 
     @property
     def is_trade_signal(self) -> bool:
@@ -299,4 +384,7 @@ class SignalDecision:
             "score_breakdown": self.score_breakdown.to_dict() if self.score_breakdown else None,
             "warnings": list(self.warnings),
             "thresholds": dict(self.thresholds),
+            **{name: getattr(self.quality, name) for name in QUALITY_FIELDS},
+            "quality": self.quality.to_dict(),
+            "engine_version": self.engine_version,
         }

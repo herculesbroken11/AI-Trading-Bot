@@ -1,5 +1,5 @@
 """
-TNA / TZA Signal Engine v1 (Checkpoint 2.11) — signal generation only.
+TNA / TZA Signal Engine (v1 Checkpoint 2.11; v2 quality gates Checkpoint 2.15) — signal generation only.
 
 Order of evaluation (each step can end in SKIP):
   1. Freshness gate: every required core symbol (TNA, TZA, IWM, SPY, QQQ) must
@@ -10,6 +10,9 @@ Order of evaluation (each step can end in SKIP):
   3. Conservative scoring: IWM drives direction, SPY/QQQ confirm, TNA/TZA
      consistency, VIX only reduces conviction (never required).
   4. Thresholds: bullish >= 70 and bearish <= 40 -> TNA; mirror -> TZA; else SKIP.
+  5. Quality gates (backend.signals.quality_gates): a TNA/TZA candidate must
+     show short-window continuation and broad confirmation; pullbacks, fading,
+     overextension/stalling and choppy confirmation turn it into SKIP.
 
 This module never imports execution code and never places orders.
 """
@@ -30,10 +33,12 @@ from backend.signals.models import (
     QuoteFreshnessStatus,
     SignalDecision,
     SignalDirection,
+    SignalQuality,
     SignalReason,
     SignalScoreBreakdown,
     SymbolQuote,
 )
+from backend.signals.quality_gates import QualityAssessment, assess_quality, gate_failure
 
 IWM_LEVEL_POINTS = 20.0
 IWM_MOMENTUM_POINTS = 20.0
@@ -224,6 +229,7 @@ class TnaTzaSignalEngine:
             gate_passed: bool,
             regime: str = "unknown",
             breakdown: Optional[SignalScoreBreakdown] = None,
+            quality: Optional[SignalQuality] = None,
         ) -> SignalDecision:
             return SignalDecision(
                 decision=SignalDirection.SKIP,
@@ -240,6 +246,7 @@ class TnaTzaSignalEngine:
                 score_breakdown=breakdown,
                 warnings=warnings,
                 thresholds=self._thresholds(),
+                quality=quality or SignalQuality.not_evaluated(),
             )
 
         # 1. Freshness gate — nothing else is computed if it fails.
@@ -390,6 +397,9 @@ class TnaTzaSignalEngine:
                 warnings.append(f"VIX elevated ({vix_level:g}); confidence reduced")
 
         regime = self._regime(trends, iwm_bull, iwm_bear, vix_extreme or vix_elevated)
+        bull, bear = breakdown.bullish, breakdown.bearish
+        lean = primary or (1 if bull >= bear else -1)
+        lean_quality = self._quality(assess_quality(lean, quotes, trends, cfg.momentum_threshold_pct), "no_candidate")
 
         if vix_extreme:
             return skip(
@@ -398,6 +408,7 @@ class TnaTzaSignalEngine:
                 gate_passed=True,
                 regime=regime,
                 breakdown=breakdown,
+                quality=lean_quality,
             )
         if primary != 0 and len(disagreeing) == 2:
             return skip(
@@ -406,10 +417,10 @@ class TnaTzaSignalEngine:
                 gate_passed=True,
                 regime=regime,
                 breakdown=breakdown,
+                quality=lean_quality,
             )
 
         # 4. Thresholds.
-        bull, bear = breakdown.bullish, breakdown.bearish
         if bull >= cfg.entry_score_threshold and bear <= cfg.opposing_score_max:
             direction = SignalDirection.BULLISH
         elif bear >= cfg.entry_score_threshold and bull <= cfg.opposing_score_max:
@@ -422,6 +433,7 @@ class TnaTzaSignalEngine:
                     gate_passed=True,
                     regime=regime,
                     breakdown=breakdown,
+                    quality=lean_quality,
                 )
             return skip(
                 SignalReason.INSUFFICIENT_SIGNAL_STRENGTH,
@@ -430,10 +442,34 @@ class TnaTzaSignalEngine:
                 gate_passed=True,
                 regime=regime,
                 breakdown=breakdown,
+                quality=lean_quality,
             )
 
+        # 5. Quality gates: can only turn the candidate into SKIP.
         symbol = SYMBOL_FOR_DIRECTION[direction]
         winning = bull if direction is SignalDirection.BULLISH else bear
+        assessment = assess_quality(
+            1 if direction is SignalDirection.BULLISH else -1, quotes, trends, cfg.momentum_threshold_pct
+        )
+        failure = gate_failure(
+            assessment,
+            momentum_threshold_pct=cfg.momentum_threshold_pct,
+            winning_score=winning,
+            entry_threshold=cfg.entry_score_threshold,
+        )
+        if failure is not None:
+            gate_reason, detail = failure
+            return skip(
+                gate_reason,
+                f"quality gate {gate_reason.value}: {symbol} candidate ({winning:g}) skipped — {detail}",
+                gate_passed=True,
+                regime=regime,
+                breakdown=breakdown,
+                quality=self._quality(assessment, gate_reason.value),
+            )
+        if assessment.confidence_penalty > 0:
+            warnings.append(f"pullback risk {assessment.pullback_risk_score:g}; confidence reduced by {assessment.confidence_penalty:g}")
+
         reason = (
             SignalReason.BULLISH_CONFIRMED
             if direction is SignalDirection.BULLISH
@@ -443,21 +479,40 @@ class TnaTzaSignalEngine:
         return SignalDecision(
             decision=direction,
             selected_symbol=symbol,
-            confidence_score=winning,
+            confidence_score=winning - assessment.confidence_penalty,
             bullish_score=bull,
             bearish_score=bear,
             skip_reason=None,
             quote_freshness_by_symbol=freshness,
             market_regime=regime,
-            explanation=f"{reason.value} -> {symbol}: {drivers}",
+            explanation=(
+                f"{reason.value} -> {symbol}: {drivers}; quality gates passed "
+                f"(continuation {assessment.continuation_score:g}, confirmation {assessment.confirmation_score:g})"
+            ),
             created_at=created_at,
             freshness_gate_passed=True,
             score_breakdown=breakdown,
             warnings=warnings,
             thresholds=self._thresholds(),
+            quality=self._quality(assessment, None),
         )
 
     # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _quality(assessment: QualityAssessment, reason: Optional[str]) -> SignalQuality:
+        return SignalQuality(
+            evaluated=True,
+            direction=(SignalDirection.BULLISH if assessment.direction == 1 else SignalDirection.BEARISH).value,
+            continuation_score=assessment.continuation_score,
+            confirmation_score=assessment.confirmation_score,
+            chop_risk_score=assessment.chop_risk_score,
+            pullback_risk_score=assessment.pullback_risk_score,
+            quality_gate_passed=reason is None,
+            quality_gate_reason=reason,
+            confidence_penalty=assessment.confidence_penalty if reason is None else 0.0,
+            metrics=dict(assessment.metrics),
+        )
 
     def _thresholds(self) -> Dict[str, float]:
         cfg = self._config
