@@ -10,6 +10,10 @@ correctness of the new decisions where follow-up data exists.
 Read-only: new decisions are never written back to the database, no setting is
 changed and nothing here can place an order. Secrets are never printed.
 
+Checkpoint 2.16: --variants current_v2,allow_smallcap_divergence_strict,... (or
+"all") adds replay-only DIAGNOSTIC strategy variants. They never affect the live
+Signal Engine, live thresholds (entry=70 opposing=40 gap=20) or any order path.
+
 Exit codes:
   0 comparison printed (also when there are no rows)
   2 configuration / database / unsafe arguments
@@ -33,6 +37,8 @@ from backend.market_data.config import MarketDataConfigError, validate_execution
 from backend.shadow_mode.analytics import DEFAULT_MIN_FOLLOWUP_MOVE_PCT, load_rows
 from backend.shadow_mode.engine_replay import REPLAY_LABEL, compare_engine_versions
 from backend.shadow_mode.runner import production_execution_block_checks
+from backend.shadow_mode.skip_opportunity_analysis import DIAGNOSTIC_NOTE
+from backend.shadow_mode.strategy_variants import VariantConfigError, compare_variants, parse_variants
 
 CONFIG_EXIT_CODE = 2
 MAX_LIMIT = 10000
@@ -120,6 +126,49 @@ def _print_comparison(c: Dict[str, Any]) -> None:
     print("orders_submitted: 0  writes_to_database: false")
 
 
+def _print_variants(v: Dict[str, Any]) -> None:
+    print("=== DIAGNOSTIC ONLY: replay-only strategy variants ===")
+    print("no DB writes | no orders | live thresholds unchanged (entry=70 opposing=40 gap=20) | live signal logic unchanged")
+    old = v["old_stored"]
+    print(
+        f"rows_evaluated: {v['rows_evaluated']}  rows_replayed: {v['rows_replayed']}  "
+        f"old_stored: bullish={old['bullish_count']} bearish={old['bearish_count']} skip={old['skip_count']}"
+    )
+    vc = v["virtual_candidates"]
+    print(
+        f"virtual_candidates (hindsight): would_have_preferred_tna={vc['would_have_preferred_tna']} "
+        f"would_have_preferred_tza={vc['would_have_preferred_tza']} would_have_skipped={vc['would_have_skipped']}"
+    )
+    for name in v["variants"]:
+        r = v["results"][name]
+        print(f"--- variant: {name} (hypothetical) ---")
+        print(
+            f"bullish={r['bullish_count']} bearish={r['bearish_count']} skip={r['skip_count']} "
+            f"scored={r['scored_count']} correct={r['correct_count']} incorrect={r['incorrect_count']} "
+            f"correct_pct={_num(r['correct_pct'])}"
+        )
+        print(
+            f"vs old stored: false_signals_filtered={r['false_signals_filtered']} "
+            f"good_signals_preserved={r['good_signals_preserved']} missed_winners={r['missed_winners']} "
+            f"new_trades={r['new_trades_vs_old']} (correct {r['new_trades_vs_old_correct']}, "
+            f"incorrect {r['new_trades_vs_old_incorrect']})"
+        )
+        print(
+            f"trades_added_vs_current_v2={r['trades_added_vs_current_v2']} "
+            f"trades_matching_hindsight={r['trades_matching_hindsight']}"
+        )
+        if r["skip_reasons"]:
+            print("skip_reasons: " + ", ".join(f"{k}={n}" for k, n in r["skip_reasons"].items()))
+        for e in r["trade_examples"]:
+            print(
+                f"  trade: run={e['run_id']} cycle={e['cycle_number']} {e['variant_decision']} "
+                f"(current_v2={e['current_v2_decision']}, old={e['old_decision']}/{e['old_skip_reason'] or '-'}) "
+                f"correct={e['hypothetical_correct']} iwm_after={_num(e['iwm_followup_move_pct'], '{:+.4f}')}% "
+                f"etf_after={_num(e['selected_followup_move_pct'], '{:+.4f}')}% rule={e['rule']}"
+            )
+    print("orders_submitted: 0  writes_to_database: false  applied_to_live: false")
+
+
 def run_replay(
     settings: Settings,
     *,
@@ -127,8 +176,13 @@ def run_replay(
     limit: int = 500,
     json_output: bool = False,
     min_followup_move_pct: float = DEFAULT_MIN_FOLLOWUP_MOVE_PCT,
+    variants: Optional[str] = None,
     rows_loader: Optional[RowsLoader] = None,
 ) -> int:
+    try:
+        variant_names = parse_variants(variants)
+    except VariantConfigError as exc:
+        return _error(str(exc), json_output)
     try:
         validate_execution_still_sandbox(settings)
     except MarketDataConfigError as exc:
@@ -156,6 +210,9 @@ def run_replay(
         warnings.append(f"row limit {limit} reached; older rows were not replayed")
 
     comparison = compare_engine_versions(rows, min_move_pct=min_followup_move_pct)
+    variant_report = (
+        compare_variants(rows, variant_names, min_move_pct=min_followup_move_pct) if variant_names else None
+    )
     execution = {
         "trading_mode": settings.trading_mode,
         "tastytrade_env": settings.tastytrade_env,
@@ -171,10 +228,13 @@ def run_replay(
             "run_ids": run_ids,
             "limit": limit,
             "comparison": comparison,
+            "strategy_variants": variant_report,
             "warnings": warnings,
             "writes_to_database": False,
             "orders_submitted": 0,
-            "note": REPLAY_LABEL,
+            "live_thresholds_unchanged": True,
+            "live_signal_logic_unchanged": True,
+            "note": REPLAY_LABEL if variant_report is None else f"{REPLAY_LABEL}; variants: {DIAGNOSTIC_NOTE}",
         }
         print(json.dumps(doc, indent=2, sort_keys=True, default=str))
         return 0
@@ -188,6 +248,9 @@ def run_replay(
     for warning in warnings:
         print(f"warning: {warning}")
     _print_comparison(comparison)
+    if variant_report is not None:
+        _print_variants(variant_report)
+        print(f"note: {DIAGNOSTIC_NOTE}")
     print(f"note: {REPLAY_LABEL}")
     return 0
 
@@ -205,6 +268,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--min-followup-move-pct", type=float, default=DEFAULT_MIN_FOLLOWUP_MOVE_PCT)
+    parser.add_argument(
+        "--variants",
+        default=None,
+        help="DIAGNOSTIC ONLY replay variants: all, or a comma list of current_v2, allow_smallcap_divergence_strict, "
+        "allow_smallcap_divergence_moderate, quality_gates_without_broad_block",
+    )
     args = parser.parse_args(argv)
 
     reset_settings_cache()
@@ -218,6 +287,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         limit=args.limit,
         json_output=args.json,
         min_followup_move_pct=args.min_followup_move_pct,
+        variants=args.variants,
     )
 
 
