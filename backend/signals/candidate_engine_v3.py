@@ -40,6 +40,10 @@ RELATIVE_POINTS = 20.0
 BROAD_POINTS = 15.0
 VIX_POINTS = 10.0
 RELATIVE_FULL_EDGE_PCT = 0.30
+HIGH_PAIR_SCORE = 22.0
+VERY_STRONG_BROAD_SCORE = 12.0
+ADAPTIVE_BROAD_FLOOR = 6.0
+BALANCED_CONFIRMED = "balanced_confirmed"
 
 
 def _utc_now() -> datetime:
@@ -88,7 +92,9 @@ class CandidateEngineV3Config:
     severe_chop_score: float = 60.0
     pullback_block_score: float = 40.0
     direction_flip_extra_points: float = 10.0
-    # Mid-window must already show at least this fraction of the momentum threshold.
+    # Shadow-only. Scores in [floor, entry) can pass when confirmation is strong.
+    adaptive_entry_floor: float = 65.0
+    # Mid-window is diagnostic only. Late reversal uses the final 10 seconds.
     mid_persist_fraction: float = 0.5
 
     def validate(self) -> "CandidateEngineV3Config":
@@ -111,6 +117,8 @@ class CandidateEngineV3Config:
             problems.append("opposition thresholds must satisfy 0 < strong <= very_strong")
         if self.direction_flip_extra_points < 10.0:
             problems.append("direction_flip_extra_points cannot be loosened below 10")
+        if self.adaptive_entry_floor < 65.0 or self.adaptive_entry_floor >= self.entry_score_threshold:
+            problems.append("adaptive_entry_floor must stay in [65, entry)")
         if not 0 < self.mid_persist_fraction <= 1.0:
             problems.append("mid_persist_fraction must be in (0, 1]")
         if problems:
@@ -164,6 +172,8 @@ class _SideScore:
     block_reason: Optional[SignalReason]
     detail: str
     metrics: Dict[str, object]
+    adaptive: bool = False
+    rejection_stage: Optional[str] = None
 
     @property
     def eligible(self) -> bool:
@@ -171,10 +181,17 @@ class _SideScore:
 
 
 def _iwm_momentum_score(signed: Optional[float], threshold: float) -> float:
-    if signed is None or signed < threshold:
+    """Full score from the strong tier. The moderate tier is partial. Direction is the caller's job."""
+    if signed is None or signed <= 0:
         return 0.0
-    fraction = min(1.0, (signed - threshold) / threshold)
-    return round(15.0 + 15.0 * fraction, 1)
+    moderate = threshold * 0.5
+    if signed >= threshold:
+        fraction = min(1.0, (signed - threshold) / threshold)
+        return round(15.0 + 15.0 * fraction, 1)
+    if signed >= moderate:
+        fraction = (signed - moderate) / (threshold - moderate)
+        return round(8.0 + 7.0 * fraction, 1)
+    return 0.0
 
 
 def _pair_confirmation_score(
@@ -334,9 +351,14 @@ def _stability_metrics(
     *,
     threshold: float,
     flat_band: float,
-    persist_fraction: float,
 ) -> Dict[str, object]:
-    """Raw window percents. Positive means that symbol rose. Missing path leaves the gates unevaluated."""
+    """Raw window percents. Positive means that symbol rose. Missing path leaves the gate unevaluated.
+
+    Late reversal is only a final-10s move strongly against the candidate.
+    A weak mid-window reading does not count.
+    Bullish is against when IWM or TNA fell hard in those 10 seconds.
+    Bearish is against when IWM rose hard or TZA fell hard. A falling IWM and a rising TZA support the bearish side.
+    """
     iwm = quotes.get("IWM")
     favoured = quotes.get(favoured_symbol)
     inverse = quotes.get(inverse_symbol)
@@ -347,7 +369,6 @@ def _stability_metrics(
     have_mid = span >= MIN_PATH_SPAN_SECONDS
     start = _move_near(iwm_samples, iwm.first_mid if iwm else None, span * 0.25) if have_mid else None
     mid = _move_near(iwm_samples, iwm.first_mid if iwm else None, span * 0.50) if have_mid else None
-    etf_mid = _move_near(fav_samples, favoured.first_mid if favoured else None, span * 0.50) if have_mid else None
     final = _window_move(iwm)
     iwm_10s = _final_10s_move(iwm, iwm_samples)
     etf_10s = _final_10s_move(favoured, fav_samples)
@@ -360,16 +381,6 @@ def _stability_metrics(
     pair_ok = None
     if etf_10s is not None and inv_10s is not None:
         pair_ok = etf_10s >= -flat_band and inv_10s <= flat_band
-    persistence_failed = None
-    if have_mid or reversal is not None:
-        failed = bool(reversal)
-        if mid is not None and mid * sign < threshold * persist_fraction:
-            failed = True
-        if etf_mid is not None and etf_mid <= -threshold:
-            failed = True
-        if not have_mid and reversal is False:
-            failed = False
-        persistence_failed = failed
     return {
         "window_start_move": start,
         "window_mid_move": mid,
@@ -378,8 +389,7 @@ def _stability_metrics(
         "final_10s_reversal": reversal,
         "selected_etf_final_10s_move": etf_10s,
         "pair_final_10s_confirmation": pair_ok,
-        "_persistence_failed": persistence_failed,
-        "_etf_mid_move": etf_mid,
+        "_persistence_failed": reversal,
     }
 
 
@@ -688,18 +698,41 @@ class CandidateEngineV3:
             inverse_symbol,
             threshold=cfg.momentum_threshold_pct,
             flat_band=cfg.flat_band_pct,
-            persist_fraction=cfg.mid_persist_fraction,
         )
 
-        # Raw IWM sign is mandatory. A rising IWM cannot select TZA, and a falling IWM cannot select TNA.
-        # There is no inverse-pair override.
-        raw_supports = iwm is not None and (
-            (sign == 1 and iwm >= cfg.momentum_threshold_pct) or (sign == -1 and iwm <= -cfg.momentum_threshold_pct)
+        # Sign is mandatory. Magnitude is tiered: strong, moderate, or weak.
+        # A rising IWM cannot select TZA, and a falling IWM cannot select TNA.
+        moderate = cfg.momentum_threshold_pct * 0.5
+        signed_ok = signed_iwm is not None and signed_iwm > 0
+        etf_confirms = favoured is not None and favoured > 0
+        very_strong_context = (
+            pair_score >= HIGH_PAIR_SCORE
+            and broad_score >= VERY_STRONG_BROAD_SCORE
+            and etf_confirms
+            and not opposed
         )
-        if not raw_supports:
+        adaptive_ok = (
+            cfg.adaptive_entry_floor <= total < cfg.entry_score_threshold
+            and pair_score >= HIGH_PAIR_SCORE
+            and etf_confirms
+            and not opposed
+            and broad_score >= ADAPTIVE_BROAD_FLOOR
+            and chop < cfg.severe_chop_score
+            and pullback < cfg.pullback_block_score
+        )
+        adaptive = False
+        rejection: Optional[str] = None
+        if not signed_ok:
             reason: Optional[SignalReason] = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
-            need = f">= +{cfg.momentum_threshold_pct:g}%" if sign == 1 else f"<= -{cfg.momentum_threshold_pct:g}%"
-            detail = f"IWM window {_fmt(iwm)} does not support {name} (need {need})"
+            need = "positive" if sign == 1 else "negative"
+            detail = f"IWM window {_fmt(iwm)} is not {need}"
+        elif signed_iwm is not None and signed_iwm < moderate and not very_strong_context:
+            reason = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
+            rejection = "iwm_threshold"
+            detail = (
+                f"IWM window {_fmt(iwm)} is below moderate momentum "
+                f"({moderate:g}%); pair and broad window are not strong enough"
+            )
         elif pair_score <= 0:
             reason = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
             detail = (
@@ -719,16 +752,31 @@ class CandidateEngineV3:
         elif chop >= cfg.severe_chop_score:
             reason = SignalReason.CHOPPY_CONFIRMATION
             detail = f"severe chop_risk_score {chop:g} (IWM window range {_fmt(window_range)})"
-        elif total < cfg.entry_score_threshold:
-            reason = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
-            detail = f"{name} candidate score {total:g} < {cfg.entry_score_threshold:g}"
-        else:
+        elif total >= cfg.entry_score_threshold:
             reason = None
             detail = (
                 f"{name} candidate score {total:g}: IWM window {_fmt(iwm)}, "
                 f"{favoured_symbol} {_fmt(favoured)}, {inverse_symbol} {_fmt(inverse)}, "
                 f"SPY {_fmt(moves['SPY'])}, QQQ {_fmt(moves['QQQ'])}"
             )
+        elif adaptive_ok:
+            reason = None
+            adaptive = True
+            detail = (
+                f"{BALANCED_CONFIRMED} score {total:g}: IWM window {_fmt(iwm)}, "
+                f"{favoured_symbol} {_fmt(favoured)}, {inverse_symbol} {_fmt(inverse)}, "
+                f"SPY {_fmt(moves['SPY'])}, QQQ {_fmt(moves['QQQ'])}"
+            )
+        elif total >= cfg.adaptive_entry_floor:
+            reason = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
+            rejection = "adaptive_entry"
+            detail = (
+                f"{name} candidate score {total:g} is in the adaptive band but confirmation is not strong enough "
+                f"for {BALANCED_CONFIRMED}"
+            )
+        else:
+            reason = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
+            detail = f"{name} candidate score {total:g} < {cfg.adaptive_entry_floor:g}"
 
         return _SideScore(
             direction=sign,
@@ -743,6 +791,8 @@ class CandidateEngineV3:
             candidate_score=total,
             block_reason=reason,
             detail=detail,
+            adaptive=adaptive,
+            rejection_stage=rejection,
             metrics={
                 "iwm_window_move_pct": iwm,
                 "iwm_signed_move_pct": signed_iwm,
@@ -772,6 +822,8 @@ class CandidateEngineV3:
         }
         for name in STABILITY_FIELDS:
             scores[name] = side.metrics.get(name)
+        if side.rejection_stage:
+            scores["rejection_stage"] = side.rejection_stage
         missing = [name for name in PROFILE_SCORE_FIELDS if name not in scores]
         if missing:
             raise RuntimeError(f"profile score fields missing: {missing}")
@@ -795,9 +847,8 @@ class CandidateEngineV3:
         if side.metrics.get("_persistence_failed") is True:
             return (
                 SignalReason.LATE_REVERSAL_RISK,
-                "late_reversal_risk: IWM or the selected ETF did not keep the same direction through the mid-window "
-                f"and the final 10s (IWM mid {_fmt(_as_float(side.metrics.get('window_mid_move')))}, "
-                f"IWM final 10s {_fmt(_as_float(side.metrics.get('final_10s_move')))}, "
+                "late_reversal_risk: the final 10s moved strongly against the candidate "
+                f"(IWM final 10s {_fmt(_as_float(side.metrics.get('final_10s_move')))}, "
                 f"ETF final 10s {_fmt(_as_float(side.metrics.get('selected_etf_final_10s_move')))})",
             )
         opposite = (previous == SignalDirection.BULLISH.value and side.direction == -1) or (
@@ -854,7 +905,13 @@ class CandidateEngineV3:
 
     def _candidate(self, finish, side: _SideScore, bull: _SideScore, bear: _SideScore, warnings: List[str]):
         direction = SignalDirection.BULLISH if side.direction == 1 else SignalDirection.BEARISH
-        reason = SignalReason.BULLISH_CONFIRMED if side.direction == 1 else SignalReason.BEARISH_CONFIRMED
+        if side.adaptive:
+            final_reason = BALANCED_CONFIRMED
+            label = BALANCED_CONFIRMED
+        else:
+            confirmed = SignalReason.BULLISH_CONFIRMED if side.direction == 1 else SignalReason.BEARISH_CONFIRMED
+            final_reason = confirmed.value
+            label = confirmed.value
         symbol = "TNA" if side.direction == 1 else "TZA"
         regime = "risk_on" if side.direction == 1 else "risk_off"
         if side.broad_window_score < 10.0:
@@ -863,12 +920,12 @@ class CandidateEngineV3:
             direction=direction,
             symbol=symbol,
             reason=None,
-            explanation=f"{reason.value} -> {symbol}: {side.detail}",
+            explanation=f"{label} -> {symbol}: {side.detail}",
             gate_passed=True,
             regime=regime,
             bull=bull.candidate_score,
             bear=bear.candidate_score,
-            scores=self._scores_for(side, direction=direction.value, final_reason=reason.value),
+            scores=self._scores_for(side, direction=direction.value, final_reason=final_reason),
             breakdown=self._breakdown(bull, bear),
             quality=self._quality(side, True),
             warnings=warnings,

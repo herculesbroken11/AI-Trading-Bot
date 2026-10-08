@@ -237,16 +237,26 @@ def _sign_failure(replayed: Mapping[str, Any]) -> bool:
     return False
 
 
+def _correct_pct(flags: Sequence[Optional[bool]]) -> Optional[float]:
+    scored = [flag for flag in flags if flag is not None]
+    if not scored:
+        return None
+    return round(sum(1 for flag in scored if flag) / len(scored) * 100.0, 1)
+
+
 def confirmation_comparison(
     rows: Sequence[Mapping[str, Any]],
     *,
     min_move_pct: float,
 ) -> Dict[str, Any]:
-    """Before/after the 2.17B path and flip filters. The sign gate stays on in both passes."""
+    """Before/after path and flip filters. Sign, momentum tiers, and adaptive entry apply to both passes."""
     previous_by_run: Dict[str, Optional[str]] = {}
     before_count = after_count = 0
     false_filtered = good_preserved = missed_winners = 0
     sign_failures = late_reversals = flip_cooldowns = 0
+    iwm_rejected = adaptive_rejected = 0
+    before_flags: List[Optional[bool]] = []
+    after_flags: List[Optional[bool]] = []
     for row in _ordered_rows(rows):
         run_id = str(row.get("run_id") or "")
         before = replay_profile_row(row, BALANCED_V3_SHADOW, previous_direction=None, apply_path_filters=False)
@@ -260,14 +270,21 @@ def confirmation_comparison(
         after_decision = after.get("decision") if after.get("replayed") else SKIP
         if before_decision in TRADE_DECISIONS:
             before_count += 1
+            before_flags.append(score_hypothetical(str(before_decision), row, min_move_pct=min_move_pct))
         if after_decision in TRADE_DECISIONS:
             after_count += 1
+            after_flags.append(score_hypothetical(str(after_decision), row, min_move_pct=min_move_pct))
         if _sign_failure(before) or _sign_failure(after):
             sign_failures += 1
         if after.get("skip_reason") == "late_reversal_risk":
             late_reversals += 1
         if after.get("skip_reason") == "direction_flip_cooldown":
             flip_cooldowns += 1
+        stage = (after.get("profile_scores") or {}).get("rejection_stage")
+        if stage == "iwm_threshold":
+            iwm_rejected += 1
+        elif stage == "adaptive_entry":
+            adaptive_rejected += 1
         before_correct = score_hypothetical(str(before_decision), row, min_move_pct=min_move_pct)
         if before_decision in TRADE_DECISIONS and after_decision == SKIP and before_correct is False:
             false_filtered += 1
@@ -279,9 +296,14 @@ def confirmation_comparison(
     return {
         "candidates_before_filters": before_count,
         "candidates_after_filters": after_count,
+        "candidates_rejected_by_iwm_threshold": iwm_rejected,
+        "candidates_rejected_by_late_reversal": late_reversals,
+        "candidates_rejected_by_adaptive_entry": adaptive_rejected,
         "false_candidates_filtered": false_filtered,
         "good_candidates_preserved": good_preserved,
         "missed_winners": missed_winners,
+        "correct_pct_before_filters": _correct_pct(before_flags),
+        "correct_pct_after_filters": _correct_pct(after_flags),
         "direction_sign_failures": sign_failures,
         "late_reversal_risk_count": late_reversals,
         "direction_flip_cooldown_count": flip_cooldowns,

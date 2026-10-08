@@ -203,9 +203,18 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
                 f"candidates_after_filters: {stats['candidates_after_filters']}"
             )
             print(
+                f"candidates_rejected_by_iwm_threshold: {stats.get('candidates_rejected_by_iwm_threshold', 0)}  "
+                f"candidates_rejected_by_late_reversal: {stats.get('candidates_rejected_by_late_reversal', 0)}  "
+                f"candidates_rejected_by_adaptive_entry: {stats.get('candidates_rejected_by_adaptive_entry', 0)}"
+            )
+            print(
                 f"false_candidates_filtered: {stats['false_candidates_filtered']}  "
                 f"good_candidates_preserved: {stats['good_candidates_preserved']}  "
                 f"missed_winners: {stats['missed_winners']}"
+            )
+            print(
+                f"correct_pct_before_filters: {_num(stats.get('correct_pct_before_filters'))}  "
+                f"correct_pct_after_filters: {_num(stats.get('correct_pct_after_filters'))}"
             )
             print(
                 f"direction_sign_failures: {stats['direction_sign_failures']}  "
