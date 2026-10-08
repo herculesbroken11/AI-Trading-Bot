@@ -9,11 +9,17 @@ module has no broker, order, or execution access.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from backend.shadow_mode.analytics import followup_move, score_hypothetical, score_strict_direction
 from backend.shadow_mode.engine_replay import engine_config_for_row
-from backend.signals.candidate_engine_v3 import CandidateEngineV3, CandidateEngineV3Config
+from backend.signals.candidate_engine_v3 import (
+    VIX_POLICY_HARD_BLOCK,
+    VIX_POLICY_PENALTY,
+    CandidateEngineV3,
+    CandidateEngineV3Config,
+)
 from backend.signals.models import SIGNAL_ENGINE_VERSION, MarketSnapshot, SignalDirection
 from backend.signals.profiles import BALANCED_V3_SHADOW, CONSERVATIVE_V2, normalize_signal_profile
 from backend.signals.tna_tza_signal_engine import TnaTzaSignalEngine
@@ -78,6 +84,7 @@ def replay_profile_row(
     *,
     previous_direction: Optional[str] = None,
     apply_path_filters: bool = True,
+    vix_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One hypothetical decision. Does not mutate the row."""
     selected = normalize_signal_profile(profile)
@@ -90,8 +97,11 @@ def replay_profile_row(
             engine = TnaTzaSignalEngine(engine_config_for_row(row), wall_clock=lambda: snapshot.created_at)
         else:
             age = engine_config_for_row(row).max_quote_age_seconds
+            config = CandidateEngineV3Config.from_settings(max_quote_age_seconds=age)
+            if vix_policy is not None:
+                config = replace(config, vix_policy=vix_policy)
             engine = CandidateEngineV3(
-                CandidateEngineV3Config.from_settings(max_quote_age_seconds=age),
+                config,
                 wall_clock=lambda: snapshot.created_at,
                 mode="replay",
             )
@@ -149,6 +159,7 @@ def summarize_profile(
     profile: str,
     *,
     min_move_pct: float,
+    vix_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     selected = normalize_signal_profile(profile)
     items: List[Dict[str, Any]] = []
@@ -156,7 +167,13 @@ def summarize_profile(
     for row in _ordered_rows(rows):
         run_id = str(row.get("run_id") or "")
         previous = previous_by_run.get(run_id) if selected == BALANCED_V3_SHADOW else None
-        replayed = replay_profile_row(row, selected, previous_direction=previous, apply_path_filters=True)
+        replayed = replay_profile_row(
+            row,
+            selected,
+            previous_direction=previous,
+            apply_path_filters=True,
+            vix_policy=vix_policy,
+        )
         decision = replayed.get("decision") if replayed.get("replayed") else SKIP
         items.append(
             {
@@ -322,6 +339,89 @@ def confirmation_comparison(
     }
 
 
+def _strict_change(current_pct: Optional[float], penalty_pct: Optional[float]) -> str:
+    if current_pct is None and penalty_pct is None:
+        return "unchanged"
+    if current_pct is None or penalty_pct is None:
+        return "worsened" if penalty_pct is None else "improved"
+    if penalty_pct > current_pct:
+        return "improved"
+    if penalty_pct < current_pct:
+        return "worsened"
+    return "unchanged"
+
+
+def vix_policy_comparison(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    min_move_pct: float,
+) -> Dict[str, Any]:
+    """Old hard block versus the shadow penalty. Hypothetical only."""
+    current = summarize_profile(rows, BALANCED_V3_SHADOW, min_move_pct=min_move_pct, vix_policy=VIX_POLICY_HARD_BLOCK)
+    penalty = summarize_profile(rows, BALANCED_V3_SHADOW, min_move_pct=min_move_pct, vix_policy=VIX_POLICY_PENALTY)
+    current_items = _profile_decisions(rows, vix_policy=VIX_POLICY_HARD_BLOCK)
+    penalty_items = _profile_decisions(rows, vix_policy=VIX_POLICY_PENALTY)
+    added: List[Dict[str, Any]] = []
+    recovered = 0
+    for old, new in zip(current_items, penalty_items):
+        old_trade = old["decision"] in TRADE_DECISIONS
+        new_trade = new["decision"] in TRADE_DECISIONS
+        if new_trade and not old_trade:
+            added.append(new)
+        if old.get("skip_reason") == "high_volatility" and new_trade:
+            recovered += 1
+    correct_added = sum(1 for item in added if item["correct"] is True)
+    incorrect_added = sum(1 for item in added if item["correct"] is False)
+
+    def side(stats: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "candidate_count": stats["candidate_count"],
+            "strict_correct_pct": stats["strict_correct_pct"],
+            "false_candidates": stats["false_candidates"],
+            "missed_opportunities": stats["missed_opportunities"],
+        }
+
+    return {
+        "balanced_v3_shadow_current": side(current),
+        "balanced_v3_shadow_vix_penalty": side(penalty),
+        "candidates_added_by_vix_penalty": len(added),
+        "correct_added_by_vix_penalty": correct_added,
+        "incorrect_added_by_vix_penalty": incorrect_added,
+        "vix_blocked_candidates_recovered": recovered,
+        "strict_correctness": _strict_change(current["strict_correct_pct"], penalty["strict_correct_pct"]),
+        "orders_submitted": 0,
+        "writes_to_database": False,
+    }
+
+
+def _profile_decisions(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    vix_policy: str,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    previous_by_run: Dict[str, Optional[str]] = {}
+    for row in _ordered_rows(rows):
+        run_id = str(row.get("run_id") or "")
+        replayed = replay_profile_row(
+            row,
+            BALANCED_V3_SHADOW,
+            previous_direction=previous_by_run.get(run_id),
+            apply_path_filters=True,
+            vix_policy=vix_policy,
+        )
+        decision = replayed.get("decision") if replayed.get("replayed") else SKIP
+        items.append(
+            {
+                "decision": decision,
+                "skip_reason": replayed.get("skip_reason"),
+                "correct": score_strict_direction(str(decision), row),
+            }
+        )
+        previous_by_run[run_id] = decision if decision in TRADE_DECISIONS else None
+    return items
+
+
 def compare_signal_profiles(
     rows: Sequence[Mapping[str, Any]],
     profiles: Sequence[str],
@@ -335,10 +435,13 @@ def compare_signal_profiles(
         if name == BALANCED_V3_SHADOW:
             stats.update(confirmation_comparison(rows, min_move_pct=min_move_pct))
         profiles_report[name] = stats
-    return {
+    report: Dict[str, Any] = {
         "profiles": profiles_report,
         "orders_submitted": 0,
         "writes_to_database": False,
         "applied_to_live": False,
         "note": REPLAY_NOTE,
     }
+    if BALANCED_V3_SHADOW in selected:
+        report["vix_policy_comparison"] = vix_policy_comparison(rows, min_move_pct=min_move_pct)
+    return report

@@ -251,6 +251,23 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
                 f"chop={_num(example.get('chop_risk_score'))} "
                 f"pullback={_num(example.get('pullback_risk_score'))}"
             )
+    comparison = report.get("vix_policy_comparison")
+    if comparison:
+        print("=== vix policy comparison (hypothetical; no orders; no DB writes) ===")
+        for name in ("balanced_v3_shadow_current", "balanced_v3_shadow_vix_penalty"):
+            side = comparison[name]
+            print(f"--- {name} ---")
+            print(
+                f"candidate_count: {side['candidate_count']}  "
+                f"strict_correct_pct: {_num(side['strict_correct_pct'])}  "
+                f"false_candidates: {side['false_candidates']}  "
+                f"missed_opportunities: {side['missed_opportunities']}"
+            )
+        print(f"candidates_added_by_vix_penalty: {comparison['candidates_added_by_vix_penalty']}")
+        print(f"correct_added_by_vix_penalty: {comparison['correct_added_by_vix_penalty']}")
+        print(f"incorrect_added_by_vix_penalty: {comparison['incorrect_added_by_vix_penalty']}")
+        print(f"vix_blocked_candidates_recovered: {comparison['vix_blocked_candidates_recovered']}")
+        print(f"strict_correctness: {comparison['strict_correctness']}")
     print("orders_submitted: 0  writes_to_database: false  applied_to_live: false")
 
 

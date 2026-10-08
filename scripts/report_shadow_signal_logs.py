@@ -64,6 +64,22 @@ def _print_report(report: Dict[str, Any], *, run_id: Optional[str], limit: int) 
     print(f"average_confidence_trade_signals: {_num(report['average_confidence_trade_signals'])}")
     print(f"stream_not_ready_count: {report['stream_not_ready_count']}")
     print(f"stale_followup_count: {report['stale_followup_count']}")
+    print(f"high_volatility_skip_count: {report['high_volatility_skip_count']}")
+    print(f"vix_penalty_count: {report['vix_penalty_count']}")
+    print(f"vix_hard_block_count: {report['vix_hard_block_count']}")
+    print(f"average_vix: {_num(report['average_vix'], '{:.3f}')}")
+    print(f"max_vix: {_num(report['max_vix'], '{:.3f}')}")
+    print(f"average_vix_change_pct: {_num(report['average_vix_change_pct'], '{:+.3f}')}")
+    print("vix_blocked_examples:")
+    if not report["vix_blocked_examples"]:
+        print("  none")
+    for example in report["vix_blocked_examples"]:
+        print(
+            f"  cycle={example.get('cycle_number')} score={_num(example.get('candidate_score'))} "
+            f"vix={_num(example.get('vix_last'), '{:.3f}')} "
+            f"change={_num(example.get('vix_change_pct'), '{:+.3f}')}% "
+            f"skip={example.get('skip_reason') or '-'}"
+        )
     print(f"freshness_gate_pass_pct: {_num(report['freshness_gate_pass_pct'])}")
     print(f"average_quote_age_seconds_overall: {_num(report['average_quote_age_seconds_overall'], '{:.3f}')}")
     print(f"valid_for_signal_evaluation: {str(report['valid_for_signal_evaluation']).lower()}")

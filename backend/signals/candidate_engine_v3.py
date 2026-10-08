@@ -44,6 +44,13 @@ HIGH_PAIR_SCORE = 22.0
 VERY_STRONG_BROAD_SCORE = 12.0
 ADAPTIVE_BROAD_FLOOR = 6.0
 BALANCED_CONFIRMED = "balanced_confirmed"
+VIX_POLICY_PENALTY = "penalty"
+VIX_POLICY_HARD_BLOCK = "hard_block"
+VIX_DIAGNOSTIC_PENALTY = "vix_penalty_applied"
+VIX_DIAGNOSTIC_HARD_BLOCK = "vix_hard_block"
+# Component points left after an elevated VIX reading. A strong candidate can still pass.
+VIX_ELEVATED_SCORE = 2.0
+VIX_ELEVATED_STACKED_SCORE = 0.0
 
 
 def _utc_now() -> datetime:
@@ -96,6 +103,9 @@ class CandidateEngineV3Config:
     adaptive_entry_floor: float = 65.0
     # Mid-window is diagnostic only. Late reversal uses the final 10 seconds.
     mid_persist_fraction: float = 0.5
+    # penalty: elevated VIX change or a high-but-not-extreme level lowers vix_score.
+    # hard_block: the pre-2.19 behavior, kept for replay comparison only.
+    vix_policy: str = VIX_POLICY_PENALTY
 
     def validate(self) -> "CandidateEngineV3Config":
         problems: List[str] = []
@@ -121,6 +131,8 @@ class CandidateEngineV3Config:
             problems.append("adaptive_entry_floor must stay in [65, entry)")
         if not 0 < self.mid_persist_fraction <= 1.0:
             problems.append("mid_persist_fraction must be in (0, 1]")
+        if self.vix_policy not in (VIX_POLICY_PENALTY, VIX_POLICY_HARD_BLOCK):
+            problems.append("vix_policy must be penalty or hard_block")
         if problems:
             raise ConfigurationError("Unsafe balanced_v3_shadow config: " + "; ".join(problems))
         return self
@@ -155,6 +167,16 @@ class CandidateEngineV3Config:
             "severe_chop_score": self.severe_chop_score,
             "pullback_block_score": self.pullback_block_score,
         }
+
+
+@dataclass(frozen=True)
+class _VixAssessment:
+    score: float
+    block: Optional[SignalReason]
+    note: Optional[str]
+    diagnostic: Optional[str]
+    level: Optional[float]
+    change_pct: Optional[float]
 
 
 @dataclass
@@ -447,6 +469,7 @@ class CandidateEngineV3:
         cfg = self._config
         created_at = self._wall_clock()
         freshness = self._freshness(snapshot)
+        vix_state: Dict[str, Any] = {"level": None, "change": None, "diagnostic": None}
 
         def finish(
             *,
@@ -464,6 +487,13 @@ class CandidateEngineV3:
             warnings: Optional[List[str]] = None,
         ) -> SignalDecision:
             winning = bull if direction is SignalDirection.BULLISH else bear if direction is SignalDirection.BEARISH else 0.0
+            payload = dict(scores)
+            if vix_state["diagnostic"]:
+                payload["vix_diagnostic"] = vix_state["diagnostic"]
+            if vix_state["level"] is not None:
+                payload["vix_level"] = vix_state["level"]
+            if vix_state["change"] is not None:
+                payload["vix_change_pct"] = round(float(vix_state["change"]), 3)
             return SignalDecision(
                 decision=direction,
                 selected_symbol=symbol,
@@ -481,7 +511,7 @@ class CandidateEngineV3:
                 thresholds=self._thresholds(),
                 quality=quality or SignalQuality.not_evaluated(),
                 engine_version=ENGINE_VERSION,
-                profile_scores=dict(scores),
+                profile_scores=payload,
             )
 
         required = [freshness[symbol] for symbol in REQUIRED_SIGNAL_SYMBOLS]
@@ -561,7 +591,11 @@ class CandidateEngineV3:
             )
 
         warnings: List[str] = []
-        vix_score, vix_block, vix_note = self._vix(snapshot)
+        vix = self._vix(snapshot)
+        vix_state["level"] = vix.level
+        vix_state["change"] = vix.change_pct
+        vix_state["diagnostic"] = vix.diagnostic
+        vix_score, vix_block, vix_note = vix.score, vix.block, vix.note
         if vix_note:
             warnings.append(vix_note)
 
@@ -632,22 +666,31 @@ class CandidateEngineV3:
         )
         return gate.evaluate_freshness(snapshot)
 
-    def _vix(self, snapshot: MarketSnapshot) -> Tuple[float, Optional[SignalReason], Optional[str]]:
+    def _vix(self, snapshot: MarketSnapshot) -> "_VixAssessment":
+        """Score VIX. Only an extreme level is a hard skip. Elevated change is a penalty."""
         cfg = self._config
         quote = snapshot.get(VOLATILITY_SYMBOL)
         level = quote.price if quote else None
         if level is None:
-            return 7.0, None, "VIX missing; volatility unknown (not required)"
+            return _VixAssessment(7.0, None, "VIX missing; volatility unknown (not required)", None, None, None)
         change = _pct(level, quote.prev_close if quote else None)
         rising = change is not None and change >= cfg.vix_rising_pct
+        high = level >= cfg.vix_high_level
         if level >= cfg.vix_extreme_level:
-            return 0.0, SignalReason.HIGH_VOLATILITY, f"VIX {level:g} >= extreme level {cfg.vix_extreme_level:g}"
-        if level >= cfg.vix_high_level or rising:
+            note = f"VIX {level:g} >= extreme level {cfg.vix_extreme_level:g}; {VIX_DIAGNOSTIC_HARD_BLOCK}"
+            return _VixAssessment(0.0, SignalReason.HIGH_VOLATILITY, note, VIX_DIAGNOSTIC_HARD_BLOCK, level, change)
+        if high or rising:
             change_text = "" if change is None else f", change {change:+.2f}%"
-            return 0.0, SignalReason.HIGH_VOLATILITY, f"VIX {level:g} is not calm{change_text}"
+            note = f"VIX {level:g} is not calm{change_text}"
+            if cfg.vix_policy == VIX_POLICY_HARD_BLOCK:
+                note = f"{note}; {VIX_DIAGNOSTIC_HARD_BLOCK}"
+                return _VixAssessment(0.0, SignalReason.HIGH_VOLATILITY, note, VIX_DIAGNOSTIC_HARD_BLOCK, level, change)
+            score = VIX_ELEVATED_STACKED_SCORE if high and rising else VIX_ELEVATED_SCORE
+            note = f"{note}; {VIX_DIAGNOSTIC_PENALTY}"
+            return _VixAssessment(score, None, note, VIX_DIAGNOSTIC_PENALTY, level, change)
         if level < cfg.vix_calm_level and (change is None or change < 2.0):
-            return VIX_POINTS, None, None
-        return 6.0, None, f"VIX {level:g} is acceptable but not fully calm"
+            return _VixAssessment(VIX_POINTS, None, None, None, level, change)
+        return _VixAssessment(6.0, None, f"VIX {level:g} is acceptable but not fully calm", None, level, change)
 
     def _score_side(
         self,

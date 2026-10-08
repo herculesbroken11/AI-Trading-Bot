@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -15,6 +16,8 @@ QUOTE_AGE_EVAL_MAX_SECONDS = 1.0
 STREAM_NOT_READY_EVAL_MAX_PCT = 10.0
 STALE_FOLLOWUP_EVAL_MAX_PCT = 10.0
 DEFAULT_MIN_FOLLOWUP_MOVE_PCT = 0.03
+VIX_PENALTY = "vix_penalty_applied"
+VIX_HARD_BLOCK = "vix_hard_block"
 
 _ROW_FIELDS = (
     "id",
@@ -43,6 +46,68 @@ _ROW_FIELDS = (
 )
 
 
+def _loads(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _lookup(row: Any, name: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def _vix_details(row: Any, source: Mapping[str, Any]) -> Dict[str, Any]:
+    """VIX level, change, and diagnostic from the row, stored scores, or the snapshot."""
+    scores = source.get("profile_scores")
+    if not isinstance(scores, dict):
+        parsed = _loads(_lookup(row, "raw_score_json")).get("profile_scores")
+        scores = parsed if isinstance(parsed, dict) else None
+    level = _number(source.get("vix_last"))
+    if level is None:
+        level = _number(_lookup(row, "vix_last"))
+    change = _number(source.get("vix_change_pct"))
+    diagnostic = source.get("vix_diagnostic")
+    if isinstance(scores, dict):
+        if level is None:
+            level = _number(scores.get("vix_level"))
+        if change is None:
+            change = _number(scores.get("vix_change_pct"))
+        if not diagnostic:
+            diagnostic = scores.get("vix_diagnostic")
+    if change is None or level is None:
+        quote = (_loads(_lookup(row, "raw_snapshot_json")).get("quotes") or {}).get("VIX") or {}
+        if isinstance(quote, dict):
+            if level is None:
+                level = _number(quote.get("last"))
+            if change is None:
+                last = _number(quote.get("last"))
+                prev = _number(quote.get("prev_close"))
+                if last is not None and prev is not None and prev > 0:
+                    change = (last - prev) / prev * 100.0
+                elif level is not None and prev is not None and prev > 0:
+                    change = (level - prev) / prev * 100.0
+    return {
+        "vix_last": None if level is None else round(level, 4),
+        "vix_change_pct": None if change is None else round(change, 3),
+        "vix_diagnostic": diagnostic if isinstance(diagnostic, str) else None,
+        "profile_scores": scores if isinstance(scores, dict) else None,
+    }
+
+
 def row_to_dict(row: Any) -> Dict[str, Any]:
     """Accept an ORM row, a ShadowCycleRecord or a mapping."""
     if hasattr(row, "to_dict") and not isinstance(row, Mapping):
@@ -55,6 +120,7 @@ def row_to_dict(row: Any) -> Dict[str, Any]:
     created = data.get("created_at")
     if isinstance(created, datetime):
         data["created_at"] = created.isoformat()
+    data.update(_vix_details(row, source))
     return data
 
 
@@ -87,6 +153,14 @@ def _meaningful_flag(item: Mapping[str, Any], *, min_move_pct: float) -> Optiona
     if max(abs(move) for move in known) < min_move_pct:
         return None
     return False
+
+
+def _blocked_score(item: Mapping[str, Any]) -> float:
+    scores = item.get("profile_scores") or {}
+    candidate = scores.get("candidate_score") if isinstance(scores, Mapping) else None
+    values = [_number(item.get("bullish_score")), _number(item.get("bearish_score")), _number(candidate)]
+    known = [value for value in values if value is not None]
+    return max(known) if known else 0.0
 
 
 def _outcome_block(flags: List[Optional[bool]]) -> Dict[str, Any]:
@@ -138,6 +212,15 @@ def summarize_shadow_logs(rows: Iterable[Any], *, latest: int = 10, min_followup
     symbol_ages = [_avg(d.get(f"quote_age_{s.lower()}") for d in items) for s in TRACKED_SYMBOLS]
     average_age = _avg(symbol_ages)
     freshness_pct = _pct(sum(1 for d in items if d.get("freshness_gate_passed")), len(items))
+    vix_levels = [d.get("vix_last") for d in items]
+    vix_changes = [d.get("vix_change_pct") for d in items]
+    known_vix = [float(level) for level in vix_levels if level is not None]
+    blocked = [
+        d
+        for d in items
+        if d.get("skip_reason") == "high_volatility" or d.get("vix_diagnostic") == VIX_HARD_BLOCK
+    ]
+    blocked.sort(key=_blocked_score, reverse=True)
     evaluation = _evaluation(
         items,
         freshness_pct=freshness_pct,
@@ -173,6 +256,28 @@ def summarize_shadow_logs(rows: Iterable[Any], *, latest: int = 10, min_followup
         },
         "stream_not_ready_count": stream_not_ready,
         "stale_followup_count": stale_followup,
+        "high_volatility_skip_count": sum(1 for d in items if d.get("skip_reason") == "high_volatility"),
+        "vix_penalty_count": sum(1 for d in items if d.get("vix_diagnostic") == VIX_PENALTY),
+        "vix_hard_block_count": sum(
+            1
+            for d in items
+            if d.get("vix_diagnostic") == VIX_HARD_BLOCK
+            or (d.get("skip_reason") == "high_volatility" and not d.get("vix_diagnostic"))
+        ),
+        "average_vix": _avg(vix_levels, 3),
+        "max_vix": round(max(known_vix), 3) if known_vix else None,
+        "average_vix_change_pct": _avg(vix_changes, 3),
+        "vix_blocked_examples": [
+            {
+                "run_id": d.get("run_id"),
+                "cycle_number": d.get("cycle_number"),
+                "candidate_score": _blocked_score(d),
+                "vix_last": d.get("vix_last"),
+                "vix_change_pct": d.get("vix_change_pct"),
+                "skip_reason": d.get("skip_reason"),
+            }
+            for d in blocked[:5]
+        ],
         "freshness_gate_pass_pct": freshness_pct,
         "average_quote_age_seconds_overall": average_age,
         "strict_direction_outcome": strict,
