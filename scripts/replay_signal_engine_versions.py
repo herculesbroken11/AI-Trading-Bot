@@ -197,6 +197,21 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
             f"false_candidates: {stats['false_candidates']}  "
             f"missed_opportunities: {stats['missed_opportunities']}"
         )
+        if "candidates_before_filters" in stats:
+            print(
+                f"candidates_before_filters: {stats['candidates_before_filters']}  "
+                f"candidates_after_filters: {stats['candidates_after_filters']}"
+            )
+            print(
+                f"false_candidates_filtered: {stats['false_candidates_filtered']}  "
+                f"good_candidates_preserved: {stats['good_candidates_preserved']}  "
+                f"missed_winners: {stats['missed_winners']}"
+            )
+            print(
+                f"direction_sign_failures: {stats['direction_sign_failures']}  "
+                f"late_reversal_risk_count: {stats['late_reversal_risk_count']}  "
+                f"direction_flip_cooldown_count: {stats['direction_flip_cooldown_count']}"
+            )
         print("--- examples ---")
         if not stats["examples"]:
             print("none")

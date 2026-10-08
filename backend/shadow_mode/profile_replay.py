@@ -68,7 +68,17 @@ def parse_profile_selection(raw: Optional[str]) -> List[str]:
     return names
 
 
-def replay_profile_row(row: Mapping[str, Any], profile: str) -> Dict[str, Any]:
+def _ordered_rows(rows: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    return sorted(rows, key=lambda row: (str(row.get("run_id") or ""), row.get("cycle_number") or 0, str(row.get("created_at") or "")))
+
+
+def replay_profile_row(
+    row: Mapping[str, Any],
+    profile: str,
+    *,
+    previous_direction: Optional[str] = None,
+    apply_path_filters: bool = True,
+) -> Dict[str, Any]:
     """One hypothetical decision. Does not mutate the row."""
     selected = normalize_signal_profile(profile)
     snapshot_data = _json(row.get("raw_snapshot_json"))
@@ -85,7 +95,14 @@ def replay_profile_row(row: Mapping[str, Any], profile: str) -> Dict[str, Any]:
                 wall_clock=lambda: snapshot.created_at,
                 mode="replay",
             )
-        decision = engine.decide(snapshot)
+        if selected == CONSERVATIVE_V2:
+            decision = engine.decide(snapshot)
+        else:
+            decision = engine.decide(
+                snapshot,
+                previous_direction=previous_direction,
+                apply_path_filters=apply_path_filters,
+            )
     except (KeyError, TypeError, ValueError) as exc:
         return {"replayed": False, "reason": f"snapshot replay failed ({type(exc).__name__})", "profile": selected}
     scores = dict(decision.profile_scores or {})
@@ -135,8 +152,11 @@ def summarize_profile(
 ) -> Dict[str, Any]:
     selected = normalize_signal_profile(profile)
     items: List[Dict[str, Any]] = []
-    for row in rows:
-        replayed = replay_profile_row(row, selected)
+    previous_by_run: Dict[str, Optional[str]] = {}
+    for row in _ordered_rows(rows):
+        run_id = str(row.get("run_id") or "")
+        previous = previous_by_run.get(run_id) if selected == BALANCED_V3_SHADOW else None
+        replayed = replay_profile_row(row, selected, previous_direction=previous, apply_path_filters=True)
         decision = replayed.get("decision") if replayed.get("replayed") else SKIP
         items.append(
             {
@@ -153,6 +173,8 @@ def summarize_profile(
                 "replayed": bool(replayed.get("replayed")),
             }
         )
+        if selected == BALANCED_V3_SHADOW:
+            previous_by_run[run_id] = decision if decision in TRADE_DECISIONS else None
 
     candidates = [item for item in items if item["decision"] in TRADE_DECISIONS]
     scored = [item for item in candidates if item["correct"] is not None]
@@ -199,6 +221,73 @@ def summarize_profile(
     }
 
 
+def _sign_failure(replayed: Mapping[str, Any]) -> bool:
+    """TNA with a falling IWM window, or TZA with a rising IWM window."""
+    decision = replayed.get("decision")
+    if decision not in TRADE_DECISIONS:
+        return False
+    raw = (replayed.get("profile_scores") or {}).get("window_final_move")
+    if raw is None:
+        return False
+    move = float(raw)
+    if decision == SignalDirection.BULLISH.value and move < 0:
+        return True
+    if decision == SignalDirection.BEARISH.value and move > 0:
+        return True
+    return False
+
+
+def confirmation_comparison(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    min_move_pct: float,
+) -> Dict[str, Any]:
+    """Before/after the 2.17B path and flip filters. The sign gate stays on in both passes."""
+    previous_by_run: Dict[str, Optional[str]] = {}
+    before_count = after_count = 0
+    false_filtered = good_preserved = missed_winners = 0
+    sign_failures = late_reversals = flip_cooldowns = 0
+    for row in _ordered_rows(rows):
+        run_id = str(row.get("run_id") or "")
+        before = replay_profile_row(row, BALANCED_V3_SHADOW, previous_direction=None, apply_path_filters=False)
+        after = replay_profile_row(
+            row,
+            BALANCED_V3_SHADOW,
+            previous_direction=previous_by_run.get(run_id),
+            apply_path_filters=True,
+        )
+        before_decision = before.get("decision") if before.get("replayed") else SKIP
+        after_decision = after.get("decision") if after.get("replayed") else SKIP
+        if before_decision in TRADE_DECISIONS:
+            before_count += 1
+        if after_decision in TRADE_DECISIONS:
+            after_count += 1
+        if _sign_failure(before) or _sign_failure(after):
+            sign_failures += 1
+        if after.get("skip_reason") == "late_reversal_risk":
+            late_reversals += 1
+        if after.get("skip_reason") == "direction_flip_cooldown":
+            flip_cooldowns += 1
+        before_correct = score_hypothetical(str(before_decision), row, min_move_pct=min_move_pct)
+        if before_decision in TRADE_DECISIONS and after_decision == SKIP and before_correct is False:
+            false_filtered += 1
+        if before_decision in TRADE_DECISIONS and after_decision == before_decision and before_correct is True:
+            good_preserved += 1
+        if before_decision in TRADE_DECISIONS and before_correct is True and after_decision == SKIP:
+            missed_winners += 1
+        previous_by_run[run_id] = after_decision if after_decision in TRADE_DECISIONS else None
+    return {
+        "candidates_before_filters": before_count,
+        "candidates_after_filters": after_count,
+        "false_candidates_filtered": false_filtered,
+        "good_candidates_preserved": good_preserved,
+        "missed_winners": missed_winners,
+        "direction_sign_failures": sign_failures,
+        "late_reversal_risk_count": late_reversals,
+        "direction_flip_cooldown_count": flip_cooldowns,
+    }
+
+
 def compare_signal_profiles(
     rows: Sequence[Mapping[str, Any]],
     profiles: Sequence[str],
@@ -206,8 +295,14 @@ def compare_signal_profiles(
     min_move_pct: float,
 ) -> Dict[str, Any]:
     selected = [normalize_signal_profile(name) for name in profiles]
+    profiles_report = {}
+    for name in selected:
+        stats = summarize_profile(rows, name, min_move_pct=min_move_pct)
+        if name == BALANCED_V3_SHADOW:
+            stats.update(confirmation_comparison(rows, min_move_pct=min_move_pct))
+        profiles_report[name] = stats
     return {
-        "profiles": {name: summarize_profile(rows, name, min_move_pct=min_move_pct) for name in selected},
+        "profiles": profiles_report,
         "orders_submitted": 0,
         "writes_to_database": False,
         "applied_to_live": False,

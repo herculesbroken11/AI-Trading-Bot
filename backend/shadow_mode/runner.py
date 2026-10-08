@@ -225,6 +225,9 @@ class ShadowModeRunner:
                 record.apply_session(session.record_fields())
             self._logger.log(record)
             summary.records.append(record)
+            note_cycle = getattr(self._engine, "note_shadow_cycle", None)
+            if note_cycle is not None:
+                note_cycle(result.decision)
             self._on_event("decision", {"record": record, "decision": result.decision})
 
             if self._run.followup_seconds > 0:

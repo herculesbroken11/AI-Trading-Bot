@@ -197,6 +197,8 @@ class SymbolStreamState:
     # Highest / lowest valid mid since first_mid (lets the signal engine detect fading moves).
     window_high_mid: Optional[float] = None
     window_low_mid: Optional[float] = None
+    # (received_at, mid), at most one sample per second. Used by the shadow candidate engine only.
+    mid_path: List[Tuple[float, float]] = field(default_factory=list)
     quote_updates: int = 0
     trade_updates: int = 0
     summary_updates: int = 0
@@ -277,6 +279,16 @@ class SymbolStreamState:
     def stayed_fresh(self, max_age_seconds: float) -> bool:
         return self.age_samples > 0 and self.age_max is not None and self.age_max <= max_age_seconds
 
+    def _record_mid_sample(self, received_at: float, mid: float) -> None:
+        """Keep about one mid per second so a 30s window can show mid-window and final-10s moves."""
+        if self.mid_path and received_at - self.mid_path[-1][0] < 1.0:
+            started, _mid = self.mid_path[-1]
+            self.mid_path[-1] = (started, mid)
+            return
+        self.mid_path.append((received_at, mid))
+        if len(self.mid_path) > 240:
+            del self.mid_path[: len(self.mid_path) - 240]
+
     def apply(self, event: Mapping[str, Any], *, received_at: float, wall_time: Optional[datetime]) -> bool:
         event_type = str(event.get("eventType") or "")
         if event_type == "Quote":
@@ -293,6 +305,7 @@ class SymbolStreamState:
             if mid is not None:
                 self.window_high_mid = mid if self.window_high_mid is None else max(self.window_high_mid, mid)
                 self.window_low_mid = mid if self.window_low_mid is None else min(self.window_low_mid, mid)
+                self._record_mid_sample(received_at, mid)
         elif event_type == "Trade":
             self.last_price = _keep(self.last_price, event.get("price"))
             self.last_size = _keep(self.last_size, event.get("size"))

@@ -151,6 +151,17 @@ def _print_record(out: _Output, record: ShadowCycleRecord) -> None:
             f"pullback_risk_score={_num(scores.get('pullback_risk_score'))}"
         )
         out.line(f"final_reason: {scores.get('final_reason')}")
+        if any(scores.get(name) is not None for name in ("window_mid_move", "final_10s_move", "window_final_move")):
+            out.line(
+                "stability: "
+                f"window_start_move={_num(scores.get('window_start_move'), '{:+.4f}')} "
+                f"window_mid_move={_num(scores.get('window_mid_move'), '{:+.4f}')} "
+                f"window_final_move={_num(scores.get('window_final_move'), '{:+.4f}')} "
+                f"final_10s_move={_num(scores.get('final_10s_move'), '{:+.4f}')} "
+                f"final_10s_reversal={scores.get('final_10s_reversal')} "
+                f"selected_etf_final_10s_move={_num(scores.get('selected_etf_final_10s_move'), '{:+.4f}')} "
+                f"pair_final_10s_confirmation={scores.get('pair_final_10s_confirmation')}"
+            )
     out.line(f"logged: {'db id=' + str(record.db_id) if record.db_id is not None else 'memory only'}")
     out.line("submitted: false (shadow mode never submits orders)")
 

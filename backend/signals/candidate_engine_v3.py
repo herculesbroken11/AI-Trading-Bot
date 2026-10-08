@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from backend.config.settings import ConfigurationError, Settings
 from backend.signals.models import (
@@ -62,6 +62,12 @@ def _fmt(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value:+.3f}%"
 
 
+def _as_float(value: object) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 @dataclass(frozen=True)
 class CandidateEngineV3Config:
     """Fixed balanced thresholds. Entry stays at 70; environment cannot lower it."""
@@ -81,6 +87,9 @@ class CandidateEngineV3Config:
     very_strong_oppose_pct: float = 0.15
     severe_chop_score: float = 60.0
     pullback_block_score: float = 40.0
+    direction_flip_extra_points: float = 10.0
+    # Mid-window must already show at least this fraction of the momentum threshold.
+    mid_persist_fraction: float = 0.5
 
     def validate(self) -> "CandidateEngineV3Config":
         problems: List[str] = []
@@ -100,6 +109,10 @@ class CandidateEngineV3Config:
             problems.append("pullback_block_score cannot be loosened below 40")
         if self.strong_oppose_pct <= 0 or self.very_strong_oppose_pct < self.strong_oppose_pct:
             problems.append("opposition thresholds must satisfy 0 < strong <= very_strong")
+        if self.direction_flip_extra_points < 10.0:
+            problems.append("direction_flip_extra_points cannot be loosened below 10")
+        if not 0 < self.mid_persist_fraction <= 1.0:
+            problems.append("mid_persist_fraction must be in (0, 1]")
         if problems:
             raise ConfigurationError("Unsafe balanced_v3_shadow config: " + "; ".join(problems))
         return self
@@ -150,7 +163,7 @@ class _SideScore:
     candidate_score: float
     block_reason: Optional[SignalReason]
     detail: str
-    metrics: Dict[str, Optional[float]]
+    metrics: Dict[str, object]
 
     @property
     def eligible(self) -> bool:
@@ -272,6 +285,104 @@ def _pullback_risk_score(signed: Optional[float], retrace: Optional[float]) -> f
     return 0.0
 
 
+_OMITTED = object()
+STABILITY_FIELDS = (
+    "window_start_move",
+    "window_mid_move",
+    "window_final_move",
+    "final_10s_move",
+    "final_10s_reversal",
+    "selected_etf_final_10s_move",
+    "pair_final_10s_confirmation",
+)
+MIN_PATH_SPAN_SECONDS = 8.0
+
+
+def _samples(quote: Optional[SymbolQuote]) -> List[Tuple[float, float]]:
+    if quote is None or not quote.mid_path:
+        return []
+    return [(float(t), float(mid)) for t, mid in quote.mid_path if mid is not None and mid > 0]
+
+
+def _move_near(samples: List[Tuple[float, float]], first: Optional[float], target_t: float) -> Optional[float]:
+    if not samples or first is None or first <= 0:
+        return None
+    point = min(samples, key=lambda item: abs(item[0] - target_t))
+    if abs(point[0] - target_t) > 3.0:
+        return None
+    return _pct(point[1], first)
+
+
+def _final_10s_move(quote: Optional[SymbolQuote], samples: List[Tuple[float, float]]) -> Optional[float]:
+    if quote is None or quote.mid is None or not samples:
+        return None
+    end_t = samples[-1][0]
+    if end_t < 10.0:
+        return None
+    target = end_t - 10.0
+    point = min(samples, key=lambda item: abs(item[0] - target))
+    if abs(point[0] - target) > 2.5 or point[1] <= 0:
+        return None
+    return _pct(quote.mid, point[1])
+
+
+def _stability_metrics(
+    quotes: Mapping[str, Optional[SymbolQuote]],
+    sign: int,
+    favoured_symbol: str,
+    inverse_symbol: str,
+    *,
+    threshold: float,
+    flat_band: float,
+    persist_fraction: float,
+) -> Dict[str, object]:
+    """Raw window percents. Positive means that symbol rose. Missing path leaves the gates unevaluated."""
+    iwm = quotes.get("IWM")
+    favoured = quotes.get(favoured_symbol)
+    inverse = quotes.get(inverse_symbol)
+    iwm_samples = _samples(iwm)
+    fav_samples = _samples(favoured)
+    inv_samples = _samples(inverse)
+    span = iwm_samples[-1][0] if iwm_samples else 0.0
+    have_mid = span >= MIN_PATH_SPAN_SECONDS
+    start = _move_near(iwm_samples, iwm.first_mid if iwm else None, span * 0.25) if have_mid else None
+    mid = _move_near(iwm_samples, iwm.first_mid if iwm else None, span * 0.50) if have_mid else None
+    etf_mid = _move_near(fav_samples, favoured.first_mid if favoured else None, span * 0.50) if have_mid else None
+    final = _window_move(iwm)
+    iwm_10s = _final_10s_move(iwm, iwm_samples)
+    etf_10s = _final_10s_move(favoured, fav_samples)
+    inv_10s = _final_10s_move(inverse, inv_samples)
+    reversal = None
+    if iwm_10s is not None or etf_10s is not None:
+        iwm_against = iwm_10s is not None and iwm_10s * sign <= -threshold
+        etf_against = etf_10s is not None and etf_10s <= -threshold
+        reversal = iwm_against or etf_against
+    pair_ok = None
+    if etf_10s is not None and inv_10s is not None:
+        pair_ok = etf_10s >= -flat_band and inv_10s <= flat_band
+    persistence_failed = None
+    if have_mid or reversal is not None:
+        failed = bool(reversal)
+        if mid is not None and mid * sign < threshold * persist_fraction:
+            failed = True
+        if etf_mid is not None and etf_mid <= -threshold:
+            failed = True
+        if not have_mid and reversal is False:
+            failed = False
+        persistence_failed = failed
+    return {
+        "window_start_move": start,
+        "window_mid_move": mid,
+        "window_final_move": final,
+        "final_10s_move": iwm_10s,
+        "final_10s_reversal": reversal,
+        "selected_etf_final_10s_move": etf_10s,
+        "pair_final_10s_confirmation": pair_ok,
+        "_persistence_failed": persistence_failed,
+        "_etf_mid_move": etf_mid,
+    }
+
+
 def _empty_scores(reason: str) -> Dict[str, object]:
     scores: Dict[str, object] = {name: 0.0 for name in PROFILE_SCORE_FIELDS}
     scores["profile"] = BALANCED_V3_SHADOW
@@ -303,12 +414,26 @@ class CandidateEngineV3:
         self.mode = mode
         self._config = (config or CandidateEngineV3Config()).validate()
         self._wall_clock = wall_clock
+        self._previous_direction: Optional[str] = None
 
     @property
     def config(self) -> CandidateEngineV3Config:
         return self._config
 
-    def decide(self, snapshot: MarketSnapshot) -> SignalDecision:
+    def note_shadow_cycle(self, decision: SignalDecision) -> None:
+        """Remember the last logged shadow candidate so the next cycle can apply the flip cooldown."""
+        if decision.decision in (SignalDirection.BULLISH, SignalDirection.BEARISH):
+            self._previous_direction = decision.decision.value
+        else:
+            self._previous_direction = None
+
+    def decide(
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        previous_direction: Any = _OMITTED,
+        apply_path_filters: bool = True,
+    ) -> SignalDecision:
         cfg = self._config
         created_at = self._wall_clock()
         freshness = self._freshness(snapshot)
@@ -432,7 +557,8 @@ class CandidateEngineV3:
 
         bull = self._score_side(+1, moves, quotes, vix_score)
         bear = self._score_side(-1, moves, quotes, vix_score)
-        lean = bull if (moves["IWM"] or 0.0) >= 0 else bear
+        lean = bull if (moves["IWM"] or 0.0) > 0 else bear if (moves["IWM"] or 0.0) < 0 else bull
+        remembered = self._previous_direction if previous_direction is _OMITTED else previous_direction
         if vix_block is not None:
             return self._skip_side(
                 finish,
@@ -446,9 +572,10 @@ class CandidateEngineV3:
             )
 
         eligible = [side for side in (bull, bear) if side.eligible]
+        chosen: Optional[_SideScore] = None
         if len(eligible) == 1:
-            return self._candidate(finish, eligible[0], bull, bear, warnings)
-        if len(eligible) > 1:
+            chosen = eligible[0]
+        elif len(eligible) > 1:
             eligible.sort(key=lambda side: side.candidate_score, reverse=True)
             if eligible[0].candidate_score - eligible[1].candidate_score < 10.0:
                 return self._skip_side(
@@ -461,7 +588,22 @@ class CandidateEngineV3:
                     warnings=warnings,
                     explanation="bullish and bearish candidate scores are too close",
                 )
-            return self._candidate(finish, eligible[0], bull, bear, warnings)
+            chosen = eligible[0]
+        if chosen is not None:
+            blocked = self._confirmation_block(chosen, apply_path_filters=apply_path_filters, previous=remembered)
+            if blocked is None:
+                return self._candidate(finish, chosen, bull, bear, warnings)
+            reason, detail = blocked
+            return self._skip_side(
+                finish,
+                chosen,
+                bull,
+                bear,
+                reason=reason,
+                regime="mixed",
+                warnings=warnings,
+                explanation=detail,
+            )
         return self._skip_side(
             finish,
             lean,
@@ -539,13 +681,25 @@ class CandidateEngineV3:
             very=cfg.very_strong_oppose_pct,
         )
         total = round(min(100.0, iwm_score + pair_score + relative_score + broad_score + vix_score), 1)
+        stability = _stability_metrics(
+            quotes,
+            sign,
+            favoured_symbol,
+            inverse_symbol,
+            threshold=cfg.momentum_threshold_pct,
+            flat_band=cfg.flat_band_pct,
+            persist_fraction=cfg.mid_persist_fraction,
+        )
 
-        if signed_iwm is None or signed_iwm < cfg.momentum_threshold_pct:
+        # Raw IWM sign is mandatory. A rising IWM cannot select TZA, and a falling IWM cannot select TNA.
+        # There is no inverse-pair override.
+        raw_supports = iwm is not None and (
+            (sign == 1 and iwm >= cfg.momentum_threshold_pct) or (sign == -1 and iwm <= -cfg.momentum_threshold_pct)
+        )
+        if not raw_supports:
             reason: Optional[SignalReason] = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
-            detail = (
-                f"IWM short-window {_fmt(signed_iwm)} is not {name} enough "
-                f"(need >= +{cfg.momentum_threshold_pct:g}%)"
-            )
+            need = f">= +{cfg.momentum_threshold_pct:g}%" if sign == 1 else f"<= -{cfg.momentum_threshold_pct:g}%"
+            detail = f"IWM window {_fmt(iwm)} does not support {name} (need {need})"
         elif pair_score <= 0:
             reason = SignalReason.INSUFFICIENT_SIGNAL_STRENGTH
             detail = (
@@ -571,7 +725,7 @@ class CandidateEngineV3:
         else:
             reason = None
             detail = (
-                f"{name} candidate score {total:g}: IWM {_fmt(signed_iwm)}, "
+                f"{name} candidate score {total:g}: IWM window {_fmt(iwm)}, "
                 f"{favoured_symbol} {_fmt(favoured)}, {inverse_symbol} {_fmt(inverse)}, "
                 f"SPY {_fmt(moves['SPY'])}, QQQ {_fmt(moves['QQQ'])}"
             )
@@ -598,6 +752,7 @@ class CandidateEngineV3:
                 "qqq_window_move_pct": moves["QQQ"],
                 "iwm_window_range_pct": window_range,
                 "iwm_window_retrace_ratio": retrace,
+                **stability,
             },
         )
 
@@ -615,10 +770,47 @@ class CandidateEngineV3:
             "pullback_risk_score": side.pullback_risk_score,
             "final_reason": final_reason,
         }
+        for name in STABILITY_FIELDS:
+            scores[name] = side.metrics.get(name)
         missing = [name for name in PROFILE_SCORE_FIELDS if name not in scores]
         if missing:
             raise RuntimeError(f"profile score fields missing: {missing}")
         return scores
+
+    def _confirmation_block(
+        self,
+        side: _SideScore,
+        *,
+        apply_path_filters: bool,
+        previous: Optional[str],
+    ) -> Optional[Tuple[SignalReason, str]]:
+        """Shadow confirmation after a candidate already passed the direction and score gates."""
+        raw = side.metrics.get("iwm_window_move_pct")
+        if side.direction == 1 and (raw is None or float(raw) <= 0):
+            return SignalReason.INSUFFICIENT_SIGNAL_STRENGTH, f"IWM window {_fmt(raw if isinstance(raw, (int, float)) else None)} is not positive"
+        if side.direction == -1 and (raw is None or float(raw) >= 0):
+            return SignalReason.INSUFFICIENT_SIGNAL_STRENGTH, f"IWM window {_fmt(raw if isinstance(raw, (int, float)) else None)} is not negative"
+        if not apply_path_filters:
+            return None
+        if side.metrics.get("_persistence_failed") is True:
+            return (
+                SignalReason.LATE_REVERSAL_RISK,
+                "late_reversal_risk: IWM or the selected ETF did not keep the same direction through the mid-window "
+                f"and the final 10s (IWM mid {_fmt(_as_float(side.metrics.get('window_mid_move')))}, "
+                f"IWM final 10s {_fmt(_as_float(side.metrics.get('final_10s_move')))}, "
+                f"ETF final 10s {_fmt(_as_float(side.metrics.get('selected_etf_final_10s_move')))})",
+            )
+        opposite = (previous == SignalDirection.BULLISH.value and side.direction == -1) or (
+            previous == SignalDirection.BEARISH.value and side.direction == 1
+        )
+        required = self._config.entry_score_threshold + self._config.direction_flip_extra_points
+        if opposite and side.candidate_score < required:
+            return (
+                SignalReason.DIRECTION_FLIP_COOLDOWN,
+                f"direction_flip_cooldown: {side.name} score {side.candidate_score:g} < {required:g} "
+                f"after a {previous} cycle",
+            )
+        return None
 
     def _breakdown(self, bull: _SideScore, bear: _SideScore) -> SignalScoreBreakdown:
         breakdown = SignalScoreBreakdown()

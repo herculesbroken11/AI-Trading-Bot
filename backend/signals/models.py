@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from backend.market_data.stream_models import StreamState
 
@@ -43,6 +43,9 @@ class SignalReason(str, Enum):
     CHOPPY_CONFIRMATION = "choppy_confirmation"
     PULLBACK_RISK = "pullback_risk"
     OVEREXTENDED_OR_STALLING = "overextended_or_stalling"
+    # balanced_v3_shadow confirmation only. Never used by conservative_v2.
+    LATE_REVERSAL_RISK = "late_reversal_risk"
+    DIRECTION_FLIP_COOLDOWN = "direction_flip_cooldown"
 
 
 QUALITY_GATE_REASONS = frozenset(
@@ -57,6 +60,31 @@ QUALITY_GATE_REASONS = frozenset(
 
 def _round(value: Optional[float], digits: int = 4) -> Optional[float]:
     return None if value is None else round(value, digits)
+
+
+def _stream_mid_path(sym: Any) -> Optional[Tuple[Tuple[float, float], ...]]:
+    """Convert stream (received_at, mid) samples into seconds since the window baseline."""
+    samples = getattr(sym, "mid_path", None) or []
+    origin = getattr(sym, "first_mid_received_at", None)
+    if origin is None or not samples:
+        return None
+    points = []
+    for received_at, mid in samples:
+        if mid is None:
+            continue
+        points.append((round(float(received_at) - float(origin), 3), float(mid)))
+    return tuple(points) or None
+
+
+def _mid_path(raw: Any) -> Optional[Tuple[Tuple[float, float], ...]]:
+    if not raw:
+        return None
+    points = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        points.append((float(item[0]), float(item[1])))
+    return tuple(points) or None
 
 
 @dataclass(frozen=True)
@@ -76,6 +104,8 @@ class SymbolQuote:
     diagnostic_only: bool = False
     window_high_mid: Optional[float] = None
     window_low_mid: Optional[float] = None
+    # Optional (seconds_from_window_start, mid) samples. Empty on snapshots stored before 2.17B.
+    mid_path: Optional[Tuple[Tuple[float, float], ...]] = None
 
     @property
     def has_quote(self) -> bool:
@@ -102,7 +132,7 @@ class SymbolQuote:
         return (self.ask - self.bid) / mid * 100.0  # type: ignore[operator]
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "symbol": self.symbol,
             "bid": self.bid,
             "ask": self.ask,
@@ -121,6 +151,9 @@ class SymbolQuote:
             "quote_updates": self.quote_updates,
             "diagnostic_only": self.diagnostic_only,
         }
+        if self.mid_path:
+            data["mid_path"] = [[round(t, 3), _round(mid)] for t, mid in self.mid_path]
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SymbolQuote":
@@ -146,6 +179,7 @@ class SymbolQuote:
             diagnostic_only=bool(data.get("diagnostic_only", False)),
             window_high_mid=num("window_high_mid"),
             window_low_mid=num("window_low_mid"),
+            mid_path=_mid_path(data.get("mid_path")),
         )
 
 
@@ -186,6 +220,7 @@ class MarketSnapshot:
                 diagnostic_only=sym.diagnostic_only,
                 window_high_mid=sym.window_high_mid,
                 window_low_mid=sym.window_low_mid,
+                mid_path=_stream_mid_path(sym),
             )
         return cls(quotes=quotes, created_at=created_at or datetime.now(timezone.utc))
 
