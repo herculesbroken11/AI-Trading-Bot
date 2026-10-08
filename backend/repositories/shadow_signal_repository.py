@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import List, Optional, Sequence
 
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, or_, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session
 
@@ -131,12 +132,24 @@ class ShadowSignalRepository:
         run_id: Optional[str] = None,
         run_ids: Optional[Sequence[str]] = None,
         limit: int = 100,
+        session_dates: Optional[Sequence[str]] = None,
     ) -> List[ShadowSignalLog]:
         query = self._session.query(ShadowSignalLog)
         if run_id:
             query = query.filter(ShadowSignalLog.run_id == run_id)
         if run_ids:
             query = query.filter(ShadowSignalLog.run_id.in_(list(run_ids)))
+        if session_dates:
+            clauses = []
+            for raw in session_dates:
+                day = datetime.strptime(str(raw)[:10], "%Y-%m-%d")
+                compact = day.strftime("%Y%m%d")
+                clauses.append(
+                    (ShadowSignalLog.created_at >= day) & (ShadowSignalLog.created_at < day + timedelta(days=1))
+                )
+                clauses.append(ShadowSignalLog.run_id.contains(compact))
+                clauses.append(ShadowSignalLog.run_id.contains(day.strftime("%Y-%m-%d")))
+            query = query.filter(or_(*clauses))
         return (
             query.order_by(ShadowSignalLog.created_at.desc(), ShadowSignalLog.id.desc())
             .limit(max(1, int(limit)))

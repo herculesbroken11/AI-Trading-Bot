@@ -356,6 +356,7 @@ class SignalDecision:
     thresholds: Mapping[str, float] = field(default_factory=dict)
     quality: SignalQuality = field(default_factory=SignalQuality.not_evaluated)
     engine_version: str = SIGNAL_ENGINE_VERSION
+    profile_scores: Optional[Mapping[str, Any]] = None
 
     @property
     def is_trade_signal(self) -> bool:
@@ -367,7 +368,7 @@ class SignalDecision:
         return self.decision.value if self.is_trade_signal else "none"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "decision": self.decision.value,
             "selected_symbol": self.selected_symbol,
             "confidence_score": round(self.confidence_score, 2),
@@ -388,3 +389,6 @@ class SignalDecision:
             "quality": self.quality.to_dict(),
             "engine_version": self.engine_version,
         }
+        if self.profile_scores is not None:
+            data["profile_scores"] = dict(self.profile_scores)
+        return data

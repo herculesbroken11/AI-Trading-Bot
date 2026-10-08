@@ -7,6 +7,10 @@ no daemon, no infinite loop). Each cycle logs one TNA / TZA / SKIP decision and,
 optionally, the market movement over a follow-up window. Nothing here can
 submit, route or place an order. Secrets are never printed.
 
+--signal-profile conservative_v2 (default) is the current v2 engine.
+--signal-profile balanced_v3_shadow uses Candidate Engine v3 for this shadow
+run only. balanced_v3_shadow still submits no orders.
+
 Checkpoint 2.14 — market session guard: the session (weekend / pre_market /
 regular_hours / near_close / after_hours) is always printed and logged per
 cycle. By default it only warns; --enforce-market-session blocks poor windows.
@@ -57,7 +61,8 @@ from backend.shadow_mode.runner import (
     validate_shadow_environment,
 )
 from backend.signals.dxlink_signal_source import DEFAULT_SIGNAL_SYMBOLS, StreamFactory
-from backend.signals.tna_tza_signal_engine import SignalEngineConfig, TnaTzaSignalEngine
+from backend.signals.models import SIGNAL_ENGINE_VERSION
+from backend.signals.profiles import BALANCED_V3_SHADOW, DEFAULT_SIGNAL_PROFILE, build_shadow_engine, normalize_signal_profile
 
 CONFIG_EXIT_CODE = 2
 SESSION_BLOCKED_EXIT_CODE = 4
@@ -131,6 +136,21 @@ def _print_record(out: _Output, record: ShadowCycleRecord) -> None:
             f"chop_risk={_num(quality.get('chop_risk_score'))} pullback_risk={_num(quality.get('pullback_risk_score'))}"
         )
     out.line(f"explanation: {record.explanation}")
+    scores = record.profile_scores
+    if scores:
+        out.line(
+            "profile_scores: "
+            f"profile={scores.get('profile')} candidate_score={_num(scores.get('candidate_score'))} "
+            f"direction={scores.get('direction')} "
+            f"iwm_momentum_score={_num(scores.get('iwm_momentum_score'))} "
+            f"pair_confirmation_score={_num(scores.get('pair_confirmation_score'))} "
+            f"relative_strength_score={_num(scores.get('relative_strength_score'))} "
+            f"broad_window_score={_num(scores.get('broad_window_score'))} "
+            f"vix_score={_num(scores.get('vix_score'))} "
+            f"chop_risk_score={_num(scores.get('chop_risk_score'))} "
+            f"pullback_risk_score={_num(scores.get('pullback_risk_score'))}"
+        )
+        out.line(f"final_reason: {scores.get('final_reason')}")
     out.line(f"logged: {'db id=' + str(record.db_id) if record.db_id is not None else 'memory only'}")
     out.line("submitted: false (shadow mode never submits orders)")
 
@@ -203,6 +223,7 @@ def run_shadow(
     min_minutes_before_close: float = 20.0,
     session_now_override: Optional[str] = None,
     session_clock: Optional[Callable[[], datetime]] = None,
+    signal_profile: Optional[str] = None,
 ) -> int:
     out = _Output(json_output)
     checks = production_execution_block_checks()
@@ -243,7 +264,9 @@ def run_shadow(
 
     try:
         max_age = max_age_seconds if max_age_seconds is not None else settings.stream_max_quote_age_seconds
-        engine = TnaTzaSignalEngine(SignalEngineConfig.from_settings(settings, max_quote_age_seconds=max_age))
+        profile = normalize_signal_profile(signal_profile or settings.signal_profile or DEFAULT_SIGNAL_PROFILE)
+        engine = build_shadow_engine(profile, settings, max_quote_age_seconds=max_age, mode="shadow")
+        engine_version = getattr(engine, "ENGINE_VERSION", SIGNAL_ENGINE_VERSION)
         run_config = ShadowRunConfig(
             cycles=cycles,
             signal_duration_seconds=signal_duration_seconds,
@@ -306,7 +329,11 @@ def run_shadow(
     out.document.update(
         {
             "market_data_config": config.safe_summary(),
+            "signal_profile": profile,
+            "engine_version": engine_version,
             "engine_config": engine.config.to_dict(),
+            "shadow_only": True,
+            "orders_submitted": 0,
             "run_config": {
                 "run_id": resolved_run_id,
                 "cycles": run_config.cycles,
@@ -330,6 +357,11 @@ def run_shadow(
     out.line(f"pause_seconds: {run_config.pause_seconds:g}")
     out.line(f"max_quote_age_seconds: {engine.config.max_quote_age_seconds:g}")
     out.line(f"symbols: {','.join(run_config.symbols)}")
+    out.line(f"signal_profile: {profile}")
+    out.line(f"engine_version: {engine_version}")
+    if profile == BALANCED_V3_SHADOW:
+        out.line("candidate_engine: balanced_v3_shadow (shadow only; no orders)")
+    out.line("shadow mode never submits orders")
     out.line(f"database_logging: {'enabled' if with_db else 'disabled (memory only)'}")
     if not start_session.status.is_regular_hours:
         out.line("warning: outside regular US market hours; expect stale-data SKIP decisions")
@@ -452,6 +484,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="tests / dry checks only: ISO datetime with offset, e.g. 2026-10-02T11:00:00-04:00",
     )
+    parser.add_argument(
+        "--signal-profile",
+        default=None,
+        choices=["conservative_v2", "balanced_v3_shadow"],
+        help="default: SIGNAL_PROFILE or conservative_v2. balanced_v3_shadow is shadow-only",
+    )
     args = parser.parse_args(argv)
 
     env_path = _REPO_ROOT / ".env"
@@ -482,6 +520,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         allow_after_hours=args.allow_after_hours,
         min_minutes_before_close=args.min_minutes_before_close,
         session_now_override=args.session_now_override,
+        signal_profile=args.signal_profile,
     )
 
 

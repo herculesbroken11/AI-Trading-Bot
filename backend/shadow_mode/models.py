@@ -155,6 +155,7 @@ class ShadowCycleRecord:
     session_guard_reason: Optional[str] = None
     submitted: bool = False
     production_execution_blocked: bool = True
+    profile_scores: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.assert_safe()
@@ -176,6 +177,15 @@ class ShadowCycleRecord:
     ) -> "ShadowCycleRecord":
         vix = snapshot.get("VIX")
         breakdown = decision.score_breakdown.to_dict() if decision.score_breakdown else None
+        profile_scores = dict(decision.profile_scores) if decision.profile_scores else None
+        score_payload: Dict[str, Any] = {
+            "score_breakdown": breakdown,
+            "thresholds": dict(decision.thresholds),
+            "quality": decision.quality.to_dict(),
+            "engine_version": decision.engine_version,
+        }
+        if profile_scores is not None:
+            score_payload["profile_scores"] = profile_scores
         return cls(
             run_id=run_id,
             cycle_number=cycle_number,
@@ -193,17 +203,9 @@ class ShadowCycleRecord:
             vix_last=vix.price if vix else None,
             freshness_gate_passed=decision.freshness_gate_passed,
             raw_snapshot_json=json.dumps(snapshot.to_dict(), sort_keys=True, default=str),
-            raw_score_json=json.dumps(
-                {
-                    "score_breakdown": breakdown,
-                    "thresholds": dict(decision.thresholds),
-                    "quality": decision.quality.to_dict(),
-                    "engine_version": decision.engine_version,
-                },
-                sort_keys=True,
-                default=str,
-            ),
+            raw_score_json=json.dumps(score_payload, sort_keys=True, default=str),
             warnings=list(decision.warnings),
+            profile_scores=profile_scores,
         )
 
     def apply_followup(self, outcome: FollowupOutcome) -> None:
@@ -237,6 +239,8 @@ class ShadowCycleRecord:
             "production_execution_blocked": self.production_execution_blocked,
             "warnings": list(self.warnings),
         }
+        if self.profile_scores is not None:
+            data["profile_scores"] = dict(self.profile_scores)
         if self.followup is not None:
             data.update(self.followup.to_dict())
         else:

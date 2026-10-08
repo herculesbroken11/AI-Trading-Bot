@@ -88,6 +88,9 @@ class Settings:
     market_data_max_quote_age_seconds: float = 60.0
     # DXLink streaming: quotes older than this are stale and must never be traded on.
     stream_max_quote_age_seconds: float = 1.0
+    # Shadow/replay signal profile. conservative_v2 is the live engine.
+    # balanced_v3_shadow is observation-only and must not be wired into execution.
+    signal_profile: str = "conservative_v2"
 
     def validate(self) -> None:
         """Enforce Phase 2 trading-safety rules at startup."""
@@ -112,6 +115,13 @@ class Settings:
                 "MARKET_DATA_READ_ONLY must be true. Production market data is "
                 "read-only in Phase 2 and can never be used for order execution."
             )
+        profile = (self.signal_profile or "").strip().lower()
+        if profile not in {"conservative_v2", "balanced_v3_shadow"}:
+            raise ConfigurationError(
+                f"Invalid SIGNAL_PROFILE={self.signal_profile!r}. "
+                "Allowed: conservative_v2 (default), balanced_v3_shadow (shadow/replay only)."
+            )
+        self.signal_profile = profile
 
     def validate_startup(self) -> None:
         """Full startup validation including broker environment."""
@@ -152,6 +162,7 @@ class Settings:
             "market_data_read_only": self.market_data_read_only,
             "market_data_scopes": self.tastytrade_market_data_scopes,
             "stream_max_quote_age_seconds": self.stream_max_quote_age_seconds,
+            "signal_profile": self.signal_profile,
             "tastytrade_market_data_client_id_configured": bool(
                 self.tastytrade_market_data_client_id
             ),
@@ -214,6 +225,7 @@ def load_settings(
         stream_max_quote_age_seconds=_parse_float(
             os.getenv("STREAM_MAX_QUOTE_AGE_SECONDS"), 1.0
         ),
+        signal_profile=_env_str("SIGNAL_PROFILE", "conservative_v2").lower() or "conservative_v2",
     )
     settings.validate()
     return settings

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from backend.config.settings import ConfigurationError
 from backend.market_data.config import MarketDataConfig
 from backend.market_data.dxlink_stream import (
     DXLinkQuoteTokenProvider,
@@ -109,6 +110,10 @@ def build_pre_submit_check(
     It approves only if a fresh re-collected decision still passes the
     freshness gate and still points the same direction. Any error -> deny.
     """
+    if getattr(engine, "IS_SHADOW_ONLY", False) or getattr(engine, "ALLOWS_EXECUTION", True) is not True:
+        raise ConfigurationError(
+            "balanced_v3_shadow is shadow/replay only and cannot revalidate a submit"
+        )
     if expected not in (SignalDirection.BULLISH, SignalDirection.BEARISH):
         raise ValueError("pre-submit check requires a bullish or bearish expectation")
 

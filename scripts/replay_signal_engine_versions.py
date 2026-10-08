@@ -14,6 +14,10 @@ Checkpoint 2.16: --variants current_v2,allow_smallcap_divergence_strict,... (or
 "all") adds replay-only DIAGNOSTIC strategy variants. They never affect the live
 Signal Engine, live thresholds (entry=70 opposing=40 gap=20) or any order path.
 
+Checkpoint 2.17A: --signal-profile balanced_v3_shadow or both replays stored
+snapshots through the shadow-only candidate engine. --session-date filters
+rows by UTC date or run id, for example 2026-10-06,2026-10-07.
+
 Exit codes:
   0 comparison printed (also when there are no rows)
   2 configuration / database / unsafe arguments
@@ -22,8 +26,10 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -36,6 +42,11 @@ from backend.config.tastytrade_urls import SANDBOX_BASE_URL
 from backend.market_data.config import MarketDataConfigError, validate_execution_still_sandbox
 from backend.shadow_mode.analytics import DEFAULT_MIN_FOLLOWUP_MOVE_PCT, load_rows
 from backend.shadow_mode.engine_replay import REPLAY_LABEL, compare_engine_versions
+from backend.shadow_mode.profile_replay import (
+    compare_signal_profiles,
+    parse_profile_selection,
+    row_matches_session_dates,
+)
 from backend.shadow_mode.runner import production_execution_block_checks
 from backend.shadow_mode.skip_opportunity_analysis import DIAGNOSTIC_NOTE
 from backend.shadow_mode.strategy_variants import VariantConfigError, compare_variants, parse_variants
@@ -46,11 +57,11 @@ MAX_LIMIT = 10000
 RowsLoader = Callable[[Settings, Optional[List[str]], int], Iterable[Any]]
 
 
-def _default_rows_loader(settings: Settings, run_ids: Optional[List[str]], limit: int):
+def _default_rows_loader(settings: Settings, run_ids: Optional[List[str]], limit: int, session_dates=None):
     from backend.repositories.shadow_signal_repository import open_shadow_repository
 
     repo = open_shadow_repository(settings.database_url, create_table=False, sql_echo=settings.sql_echo)
-    return repo.list_signals(run_ids=run_ids, limit=limit)
+    return repo.list_signals(run_ids=run_ids, limit=limit, session_dates=session_dates)
 
 
 def _num(value: Optional[float], fmt: str = "{:g}") -> str:
@@ -169,6 +180,67 @@ def _print_variants(v: Dict[str, Any]) -> None:
     print("orders_submitted: 0  writes_to_database: false  applied_to_live: false")
 
 
+def _print_profile_report(report: Dict[str, Any]) -> None:
+    print("=== signal profile comparison (hypothetical; no orders; no DB writes) ===")
+    print(report["note"])
+    for name, stats in report["profiles"].items():
+        print(f"--- profile: {name} ---")
+        print(
+            f"candidate_count: {stats['candidate_count']}  tna_count: {stats['tna_count']}  "
+            f"tza_count: {stats['tza_count']}  skip_count: {stats['skip_count']}"
+        )
+        print(
+            f"scored_count: {stats['scored_count']}  correct_count: {stats['correct_count']}  "
+            f"incorrect_count: {stats['incorrect_count']}  correct_pct: {_num(stats['correct_pct'])}"
+        )
+        print(
+            f"false_candidates: {stats['false_candidates']}  "
+            f"missed_opportunities: {stats['missed_opportunities']}"
+        )
+        print("--- examples ---")
+        if not stats["examples"]:
+            print("none")
+        for example in stats["examples"]:
+            print(
+                f"  {example['example_kind']}: run={example['run_id']} cycle={example['cycle_number']} "
+                f"{example['selected_symbol'] or example['decision']} "
+                f"score={_num(example.get('candidate_score'))} reason={example.get('final_reason') or '-'} "
+                f"correct={example.get('hypothetical_correct')} "
+                f"iwm_momentum={_num(example.get('iwm_momentum_score'))} "
+                f"pair={_num(example.get('pair_confirmation_score'))} "
+                f"relative={_num(example.get('relative_strength_score'))} "
+                f"broad={_num(example.get('broad_window_score'))} "
+                f"vix={_num(example.get('vix_score'))} "
+                f"chop={_num(example.get('chop_risk_score'))} "
+                f"pullback={_num(example.get('pullback_risk_score'))}"
+            )
+    print("orders_submitted: 0  writes_to_database: false  applied_to_live: false")
+
+
+def _parse_session_dates(raw: Optional[str]) -> Optional[List[str]]:
+    if not raw or not str(raw).strip():
+        return None
+    dates: List[str] = []
+    for part in str(raw).split(","):
+        text = part.strip()
+        if not text:
+            continue
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(f"invalid session date {text!r}; use YYYY-MM-DD") from exc
+        if text not in dates:
+            dates.append(text)
+    return dates or None
+
+
+def _load_replay_rows(loader: RowsLoader, settings: Settings, run_ids: Optional[List[str]], limit: int, session_dates):
+    parameters = inspect.signature(loader).parameters
+    if "session_dates" in parameters:
+        return loader(settings, run_ids, limit, session_dates=session_dates)
+    return loader(settings, run_ids, limit)
+
+
 def run_replay(
     settings: Settings,
     *,
@@ -178,10 +250,14 @@ def run_replay(
     min_followup_move_pct: float = DEFAULT_MIN_FOLLOWUP_MOVE_PCT,
     variants: Optional[str] = None,
     rows_loader: Optional[RowsLoader] = None,
+    signal_profile: Optional[str] = None,
+    session_dates: Optional[str] = None,
 ) -> int:
     try:
         variant_names = parse_variants(variants)
-    except VariantConfigError as exc:
+        profile_names = parse_profile_selection(signal_profile)
+        parsed_dates = _parse_session_dates(session_dates)
+    except (VariantConfigError, ValueError, ConfigurationError) as exc:
         return _error(str(exc), json_output)
     try:
         validate_execution_still_sandbox(settings)
@@ -196,7 +272,8 @@ def run_replay(
         return _error("--min-followup-move-pct must be > 0", json_output)
 
     try:
-        rows = load_rows((rows_loader or _default_rows_loader)(settings, run_ids, limit))
+        loaded = _load_replay_rows(rows_loader or _default_rows_loader, settings, run_ids, limit, parsed_dates)
+        rows = load_rows(loaded)
     except Exception as exc:
         message = str(exc) if "alembic upgrade" in str(exc) else f"database unavailable ({type(exc).__name__})"
         return _error(message, json_output, next_step="check DATABASE_URL; run: alembic upgrade head")
@@ -206,10 +283,15 @@ def run_replay(
     for rid in run_ids or []:
         if rid not in found:
             warnings.append(f"run_id not found: {rid}")
+    if parsed_dates:
+        rows = [row for row in rows if row_matches_session_dates(row, parsed_dates)]
     if len(rows) >= limit:
         warnings.append(f"row limit {limit} reached; older rows were not replayed")
 
     comparison = compare_engine_versions(rows, min_move_pct=min_followup_move_pct)
+    profile_report = (
+        compare_signal_profiles(rows, profile_names, min_move_pct=min_followup_move_pct) if profile_names else None
+    )
     variant_report = (
         compare_variants(rows, variant_names, min_move_pct=min_followup_move_pct) if variant_names else None
     )
@@ -228,6 +310,8 @@ def run_replay(
             "run_ids": run_ids,
             "limit": limit,
             "comparison": comparison,
+            "signal_profiles": profile_report,
+            "session_dates": parsed_dates,
             "strategy_variants": variant_report,
             "warnings": warnings,
             "writes_to_database": False,
@@ -248,6 +332,8 @@ def run_replay(
     for warning in warnings:
         print(f"warning: {warning}")
     _print_comparison(comparison)
+    if profile_report is not None:
+        _print_profile_report(profile_report)
     if variant_report is not None:
         _print_variants(variant_report)
         print(f"note: {DIAGNOSTIC_NOTE}")
@@ -269,6 +355,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--min-followup-move-pct", type=float, default=DEFAULT_MIN_FOLLOWUP_MOVE_PCT)
     parser.add_argument(
+        "--signal-profile",
+        default=None,
+        help="hypothetical replay profile: conservative_v2, balanced_v3_shadow, or both. "
+        "Default leaves the historical v2 comparison unchanged",
+    )
+    parser.add_argument(
+        "--session-date",
+        default=None,
+        help="comma-separated UTC session dates to replay, e.g. 2026-10-06,2026-10-07",
+    )
+    parser.add_argument(
         "--variants",
         default=None,
         help="DIAGNOSTIC ONLY replay variants: all, or a comma list of current_v2, allow_smallcap_divergence_strict, "
@@ -288,6 +385,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json_output=args.json,
         min_followup_move_pct=args.min_followup_move_pct,
         variants=args.variants,
+        signal_profile=args.signal_profile,
+        session_dates=args.session_date,
     )
 
 
