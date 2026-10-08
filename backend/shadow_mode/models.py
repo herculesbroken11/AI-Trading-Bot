@@ -11,6 +11,8 @@ from backend.signals.models import MarketSnapshot, SignalDecision, SignalDirecti
 
 TRACKED_SYMBOLS = ("TNA", "TZA", "IWM", "SPY", "QQQ")
 FOLLOWUP_MAX_QUOTE_AGE_SECONDS = 5.0
+FOLLOWUP_INDEX_MAX_AGE_SECONDS = 1.0
+STALE_FOLLOWUP_NOTE = "unscored_due_to_stale_followup"
 SESSION_FIELDS = (
     "session_label",
     "session_is_regular_hours",
@@ -93,10 +95,19 @@ def compute_followup_outcome(
         if selected_symbol
         else None
     )
+    stale_indexes = [
+        symbol
+        for symbol in ("IWM", "SPY", "QQQ")
+        if (_age(after, symbol) is not None and _age(after, symbol) > FOLLOWUP_INDEX_MAX_AGE_SECONDS)
+    ]
 
     correct: Optional[bool] = None
-    if decision == SignalDirection.SKIP.value:
+    if stale_indexes and decision != SignalDirection.SKIP.value:
+        notes.insert(0, f"{STALE_FOLLOWUP_NOTE}: {', '.join(stale_indexes)}")
+    elif decision == SignalDirection.SKIP.value:
         notes.insert(0, "skip: movement recorded only, not scored")
+        if stale_indexes:
+            notes.append(f"{STALE_FOLLOWUP_NOTE}: {', '.join(stale_indexes)}")
     else:
         if decision == SignalDirection.BULLISH.value:
             checks = [selected_move is not None and selected_move > 0, iwm_move is not None and iwm_move > 0]

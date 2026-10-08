@@ -62,13 +62,29 @@ def _print_report(report: Dict[str, Any], *, run_id: Optional[str], limit: int) 
         print("skip_reasons: " + ", ".join(f"{k}={v}" for k, v in report["skip_reasons"].items()))
     print(f"average_confidence_all: {_num(report['average_confidence_all'])}")
     print(f"average_confidence_trade_signals: {_num(report['average_confidence_trade_signals'])}")
+    print(f"stream_not_ready_count: {report['stream_not_ready_count']}")
+    print(f"stale_followup_count: {report['stale_followup_count']}")
     print(f"freshness_gate_pass_pct: {_num(report['freshness_gate_pass_pct'])}")
+    print(f"average_quote_age_seconds_overall: {_num(report['average_quote_age_seconds_overall'], '{:.3f}')}")
+    print(f"valid_for_signal_evaluation: {str(report['valid_for_signal_evaluation']).lower()}")
+    if report["evaluation_block_reasons"]:
+        print("evaluation_block_reasons: " + "; ".join(report["evaluation_block_reasons"]))
     ages = report["average_quote_age_seconds"]
     print("average_quote_age_seconds: " + " ".join(f"{s}={_num(ages.get(s), '{:.3f}')}" for s in TRACKED_SYMBOLS))
 
     outcomes = report["outcomes"]
     print("--- follow-up outcomes (direction check, not P&L) ---")
     print(f"with_followup: {outcomes['with_followup']}")
+    strict = report["strict_direction_outcome"]
+    meaningful = report["meaningful_move_outcome"]
+    print(
+        f"strict_scored_count: {strict['scored']}  strict_correct: {strict['correct']}  "
+        f"strict_incorrect: {strict['incorrect']}  strict_correct_pct: {_num(strict['correct_pct'])}"
+    )
+    print(
+        f"meaningful_scored_count: {meaningful['scored']}  meaningful_correct: {meaningful['correct']}  "
+        f"meaningful_incorrect: {meaningful['incorrect']}  meaningful_correct_pct: {_num(meaningful['correct_pct'])}"
+    )
     print(
         f"scored: {outcomes['scored']}  correct: {outcomes['correct']}  incorrect: {outcomes['incorrect']}  "
         f"correct_pct: {_num(outcomes['correct_pct'])}"

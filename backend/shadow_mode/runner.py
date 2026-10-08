@@ -11,6 +11,7 @@ This module has no broker, order or execution dependency and cannot submit order
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -31,18 +32,29 @@ from backend.market_session import MarketSessionGuard, SessionGuardDecision, get
 from backend.shadow_mode.logger import ShadowSignalLogger
 from backend.shadow_mode.models import (
     FOLLOWUP_MAX_QUOTE_AGE_SECONDS,
+    TRACKED_SYMBOLS,
     ShadowCycleError,
     ShadowCycleRecord,
     ShadowRunSummary,
     compute_followup_outcome,
 )
+from backend.shadow_mode.stream_readiness import (
+    PREFLIGHT_WAIT_SECONDS,
+    QUOTE_FRESH_SECONDS,
+    STALE_FEED_SECONDS,
+    WARMUP_FRESH_SECONDS,
+    WARMUP_TIMEOUT_SECONDS,
+    is_stale_feed,
+    quotes_are_fresh,
+)
 from backend.signals.dxlink_signal_source import (
     DEFAULT_SIGNAL_SYMBOLS,
+    DXLinkSignalResult,
     StreamFactory,
     collect_signal_from_dxlink,
     collect_snapshot_from_dxlink,
 )
-from backend.signals.models import REQUIRED_SIGNAL_SYMBOLS
+from backend.signals.models import REQUIRED_SIGNAL_SYMBOLS, MarketSnapshot
 from backend.signals.tna_tza_signal_engine import TnaTzaSignalEngine
 
 MAX_CYCLES = 100
@@ -119,6 +131,12 @@ class ShadowRunConfig:
     followup_seconds: float = 60.0
     symbols: Tuple[str, ...] = DEFAULT_SIGNAL_SYMBOLS
     followup_max_age_seconds: float = FOLLOWUP_MAX_QUOTE_AGE_SECONDS
+    readiness_checks: bool = False
+    warmup_timeout_seconds: float = WARMUP_TIMEOUT_SECONDS
+    warmup_fresh_seconds: float = WARMUP_FRESH_SECONDS
+    preflight_wait_seconds: float = PREFLIGHT_WAIT_SECONDS
+    quote_fresh_seconds: float = QUOTE_FRESH_SECONDS
+    stale_feed_seconds: float = STALE_FEED_SECONDS
 
     def validate(self) -> "ShadowRunConfig":
         problems = []
@@ -133,6 +151,12 @@ class ShadowRunConfig:
         missing = [s for s in REQUIRED_SIGNAL_SYMBOLS if s not in self.symbols]
         if missing:
             problems.append(f"symbols must include {','.join(missing)}")
+        if self.readiness_checks and self.warmup_fresh_seconds < WARMUP_FRESH_SECONDS:
+            problems.append(f"warmup must hold fresh quotes for at least {WARMUP_FRESH_SECONDS:g}s")
+        if self.readiness_checks and self.quote_fresh_seconds > QUOTE_FRESH_SECONDS:
+            problems.append(f"quote freshness cannot be looser than {QUOTE_FRESH_SECONDS:g}s")
+        if self.readiness_checks and self.stale_feed_seconds < STALE_FEED_SECONDS:
+            problems.append(f"stale-feed detection cannot start before {STALE_FEED_SECONDS:g}s")
         if problems:
             raise ConfigurationError("Invalid shadow run config: " + "; ".join(problems))
         return self
@@ -195,23 +219,26 @@ class ShadowModeRunner:
     def run(self) -> ShadowRunSummary:
         summary = ShadowRunSummary(run_id=self.run_id, cycles_requested=self._run.cycles)
         symbols: Sequence[str] = self._run.symbols
+        if self._run.readiness_checks and not self._warmup(summary):
+            return summary
         for cycle in range(1, self._run.cycles + 1):
             self._on_event("cycle_start", {"cycle": cycle, "cycles": self._run.cycles})
             session = self._check_session(summary, cycle)
             if session is not None and session.blocked:
                 break
+            if self._run.readiness_checks and not self._preflight(summary, cycle):
+                if summary.aborted:
+                    break
+                self._pause(cycle)
+                continue
             try:
-                result = collect_signal_from_dxlink(
-                    self._config,
-                    engine=self._engine,
-                    symbols=symbols,
-                    duration_seconds=self._run.signal_duration_seconds,
-                    provider=self._provider_or_default(),
-                    stream_factory=self._stream_factory,
-                )
+                result = self._collect_cycle(symbols, summary, cycle)
             except MarketDataError as exc:
                 if self._cycle_error(summary, cycle, exc):
                     break
+                self._pause(cycle)
+                continue
+            if result is None:
                 self._pause(cycle)
                 continue
 
@@ -235,6 +262,170 @@ class ShadowModeRunner:
                     break
             self._pause(cycle)
         return summary
+
+    def _open_client(self):
+        provider = self._provider_or_default()
+        if self._stream_factory is None:
+            from backend.market_data.dxlink_stream import DXLinkStreamClient
+
+            client = DXLinkStreamClient(provider, symbols=list(self._run.symbols))
+        else:
+            client = self._stream_factory(provider, list(self._run.symbols))
+        client.connect()
+        return client
+
+    def _ages(self, client) -> Dict[str, Optional[float]]:
+        now = client.now()
+        ages: Dict[str, Optional[float]] = {}
+        for symbol in REQUIRED_SIGNAL_SYMBOLS:
+            state = client.state.symbols.get(symbol)
+            ages[symbol] = None if state is None else state.quote_age_seconds(now)
+        return ages
+
+    def _snapshot_ages(self, snapshot: MarketSnapshot) -> Dict[str, Optional[float]]:
+        ages: Dict[str, Optional[float]] = {}
+        for symbol in REQUIRED_SIGNAL_SYMBOLS:
+            quote = snapshot.get(symbol)
+            ages[symbol] = None if quote is None else quote.quote_age_seconds
+        return ages
+
+    def _warmup(self, summary: ShadowRunSummary) -> bool:
+        """Connect and hold fresh required quotes before cycle 1. Failure logs no cycles."""
+        self._on_event("warmup_started", {})
+        client = None
+        reason = "required symbols were not fresh for 3 consecutive seconds before timeout"
+        try:
+            client = self._open_client()
+            started = client.now()
+            fresh_since: Optional[float] = None
+            announced = False
+            while client.now() - started < self._run.warmup_timeout_seconds:
+                client.stream(0.5, max_age_seconds=self._run.quote_fresh_seconds)
+                now = client.now()
+                ages = self._ages(client)
+                if quotes_are_fresh(ages, max_age_seconds=self._run.quote_fresh_seconds):
+                    if fresh_since is None:
+                        fresh_since = now
+                    if not announced:
+                        self._on_event("warmup_symbols_ready", {"ages": ages})
+                        announced = True
+                    if now - fresh_since >= self._run.warmup_fresh_seconds:
+                        self._on_event("warmup_complete", {"seconds": round(now - started, 3)})
+                        return True
+                else:
+                    fresh_since = None
+                    announced = False
+        except MarketDataError as exc:
+            reason = f"{exc.reason}"
+            self._cycle_error(summary, 0, exc)
+        finally:
+            if client is not None:
+                client.disconnect()
+        self._on_event("warmup_failed", {"reason": reason})
+        summary.aborted = True
+        summary.abort_reason = reason
+        return False
+
+    def _preflight(self, summary: ShadowRunSummary, cycle: int) -> bool:
+        """One refresh when quotes are stale. Still stale -> stream_not_ready, no signal score."""
+        client = None
+        try:
+            client = self._open_client()
+            client.stream(1.0, max_age_seconds=self._run.quote_fresh_seconds)
+            ages = self._ages(client)
+            if not quotes_are_fresh(ages, max_age_seconds=self._run.quote_fresh_seconds):
+                if is_stale_feed(ages, stale_seconds=self._run.stale_feed_seconds):
+                    self._on_event("stream_reconnect_due_to_stale_feed", {"cycle": cycle})
+                client.disconnect()
+                client = self._open_client()
+                deadline = client.now() + self._run.preflight_wait_seconds
+                while client.now() < deadline:
+                    client.stream(0.5, max_age_seconds=self._run.quote_fresh_seconds)
+                    ages = self._ages(client)
+                    if quotes_are_fresh(ages, max_age_seconds=self._run.quote_fresh_seconds):
+                        return True
+                snapshot = MarketSnapshot.from_stream_state(client.state, now=client.now())
+                self._log_stream_not_ready(summary, cycle, snapshot, "quotes stayed stale after one resubscribe")
+                return False
+            return True
+        except MarketDataError as exc:
+            self._cycle_error(summary, cycle, exc)
+            return False
+        finally:
+            if client is not None:
+                client.disconnect()
+
+    def _collect_cycle(self, symbols: Sequence[str], summary: ShadowRunSummary, cycle: int):
+        if not self._run.readiness_checks:
+            return collect_signal_from_dxlink(
+                self._config,
+                engine=self._engine,
+                symbols=symbols,
+                duration_seconds=self._run.signal_duration_seconds,
+                provider=self._provider_or_default(),
+                stream_factory=self._stream_factory,
+            )
+        snapshot, _summary, token_summary = collect_snapshot_from_dxlink(
+            self._config,
+            symbols=symbols,
+            duration_seconds=self._run.signal_duration_seconds,
+            max_age_seconds=self._engine.config.max_quote_age_seconds,
+            provider=self._provider_or_default(),
+            stream_factory=self._stream_factory,
+        )
+        if is_stale_feed(self._snapshot_ages(snapshot), stale_seconds=self._run.stale_feed_seconds):
+            self._on_event("stream_reconnect_due_to_stale_feed", {"cycle": "signal"})
+            snapshot, _summary, token_summary = collect_snapshot_from_dxlink(
+                self._config,
+                symbols=symbols,
+                duration_seconds=self._run.signal_duration_seconds,
+                max_age_seconds=self._engine.config.max_quote_age_seconds,
+                provider=self._provider_or_default(),
+                stream_factory=self._stream_factory,
+            )
+        if not quotes_are_fresh(self._snapshot_ages(snapshot), max_age_seconds=self._run.quote_fresh_seconds):
+            self._log_stream_not_ready(summary, cycle, snapshot, "signal window ended without fresh quotes")
+            return None
+        return DXLinkSignalResult(
+            decision=self._engine.decide(snapshot),
+            snapshot=snapshot,
+            stream_summary=_summary,
+            token_summary=token_summary,
+        )
+
+    def _log_stream_not_ready(self, summary: ShadowRunSummary, cycle: int, snapshot: Optional[MarketSnapshot], detail: str) -> None:
+        record = self._not_ready_record(cycle, snapshot, detail)
+        self._logger.log(record)
+        summary.records.append(record)
+        self._on_event("decision", {"record": record, "decision": None})
+
+    def _not_ready_record(self, cycle: int, snapshot: Optional[MarketSnapshot], detail: str) -> ShadowCycleRecord:
+        ages = {symbol: None for symbol in TRACKED_SYMBOLS}
+        mids = {symbol: None for symbol in TRACKED_SYMBOLS}
+        if snapshot is not None:
+            for symbol in TRACKED_SYMBOLS:
+                quote = snapshot.get(symbol)
+                ages[symbol] = None if quote is None else quote.quote_age_seconds
+                mids[symbol] = None if quote is None else quote.mid
+        return ShadowCycleRecord(
+            run_id=self.run_id,
+            cycle_number=cycle,
+            created_at=datetime.now(timezone.utc),
+            decision="skip",
+            selected_symbol=None,
+            confidence_score=0.0,
+            bullish_score=0.0,
+            bearish_score=0.0,
+            skip_reason="stream_not_ready",
+            market_regime="unknown",
+            explanation=f"stream_not_ready: {detail}",
+            quote_ages=ages,
+            mids=mids,
+            vix_last=None,
+            freshness_gate_passed=False,
+            raw_snapshot_json=json.dumps(snapshot.to_dict()) if snapshot is not None else "{}",
+            raw_score_json="{}",
+        )
 
     def _check_session(self, summary: ShadowRunSummary, cycle: int) -> Optional[SessionGuardDecision]:
         if self._session_guard is None:

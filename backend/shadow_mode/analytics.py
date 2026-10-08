@@ -425,11 +425,36 @@ def replay_decision(row: Mapping[str, Any], thresholds: ThresholdSet) -> Dict[st
     return {"decision": direction, "skip_reason": reason, "bullish_score": bull, "bearish_score": bear, "method": "stored_scores"}
 
 
-def score_hypothetical(direction: str, row: Mapping[str, Any], *, min_move_pct: float) -> Optional[bool]:
+def score_strict_direction(direction: str, row: Mapping[str, Any]) -> Optional[bool]:
+    """Same direction rule as the shadow report: any follow-up move counts, flat included.
+
+    Bullish is correct when TNA or IWM rose. Bearish is correct when TZA rose or IWM fell.
+    Both moves known and neither supporting the candidate is incorrect.
+    A stale index follow-up is unscored.
     """
+    if direction not in (SignalDirection.BULLISH.value, SignalDirection.BEARISH.value):
+        return None
+    if "unscored_due_to_stale_followup" in str(row.get("outcome_note") or ""):
+        return None
+    selected = followup_move(row, "TNA" if direction == SignalDirection.BULLISH.value else "TZA")
+    iwm = followup_move(row, "IWM")
+    if direction == SignalDirection.BULLISH.value:
+        supported = (selected is not None and selected > 0) or (iwm is not None and iwm > 0)
+    else:
+        supported = (selected is not None and selected > 0) or (iwm is not None and iwm < 0)
+    if supported:
+        return True
+    if selected is not None and iwm is not None:
+        return False
+    return None
+
+
+def score_hypothetical(direction: str, row: Mapping[str, Any], *, min_move_pct: float) -> Optional[bool]:
+    """Meaningful-move diagnostic. Flat follow-up below min_move_pct stays unscored.
+
     True if the selected ETF rose >= min move or IWM moved >= min move in the
     signal direction; False if something moved >= min move but not that way;
-    None if no follow-up or everything moved less than min move (flat -> unscored).
+    None if no follow-up or everything moved less than min move.
     """
     if direction not in (SignalDirection.BULLISH.value, SignalDirection.BEARISH.value):
         return None

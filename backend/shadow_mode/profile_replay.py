@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from backend.shadow_mode.analytics import followup_move, score_hypothetical
+from backend.shadow_mode.analytics import followup_move, score_hypothetical, score_strict_direction
 from backend.shadow_mode.engine_replay import engine_config_for_row
 from backend.signals.candidate_engine_v3 import CandidateEngineV3, CandidateEngineV3Config
 from backend.signals.models import SIGNAL_ENGINE_VERSION, MarketSnapshot, SignalDirection
@@ -168,7 +168,8 @@ def summarize_profile(
                 "skip_reason": replayed.get("skip_reason"),
                 "candidate_score": replayed.get("candidate_score"),
                 "profile_scores": replayed.get("profile_scores") or {},
-                "correct": score_hypothetical(str(decision), row, min_move_pct=min_move_pct),
+                "correct": score_strict_direction(str(decision), row),
+                "meaningful_correct": score_hypothetical(str(decision), row, min_move_pct=min_move_pct),
                 "iwm_followup": followup_move(row, "IWM"),
                 "replayed": bool(replayed.get("replayed")),
             }
@@ -180,6 +181,9 @@ def summarize_profile(
     scored = [item for item in candidates if item["correct"] is not None]
     correct = [item for item in scored if item["correct"] is True]
     incorrect = [item for item in scored if item["correct"] is False]
+    meaningful = [item for item in candidates if item["meaningful_correct"] is not None]
+    meaningful_correct = [item for item in meaningful if item["meaningful_correct"] is True]
+    meaningful_incorrect = [item for item in meaningful if item["meaningful_correct"] is False]
     missed = [
         item
         for item in items
@@ -211,6 +215,14 @@ def summarize_profile(
         "correct_count": correct_count,
         "incorrect_count": len(incorrect),
         "correct_pct": round(correct_count / scored_count * 100.0, 1) if scored_count else None,
+        "strict_scored_count": scored_count,
+        "strict_correct": correct_count,
+        "strict_incorrect": len(incorrect),
+        "strict_correct_pct": round(correct_count / scored_count * 100.0, 1) if scored_count else None,
+        "meaningful_scored_count": len(meaningful),
+        "meaningful_correct": len(meaningful_correct),
+        "meaningful_incorrect": len(meaningful_incorrect),
+        "meaningful_correct_pct": round(len(meaningful_correct) / len(meaningful) * 100.0, 1) if meaningful else None,
         "false_candidates": len(incorrect),
         "missed_opportunities": len(missed),
         "examples": examples,

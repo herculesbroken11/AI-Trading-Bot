@@ -193,6 +193,19 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
             f"scored_count: {stats['scored_count']}  correct_count: {stats['correct_count']}  "
             f"incorrect_count: {stats['incorrect_count']}  correct_pct: {_num(stats['correct_pct'])}"
         )
+        if "strict_scored_count" in stats:
+            print(
+                f"strict_scored_count: {stats['strict_scored_count']}  "
+                f"strict_correct: {stats['strict_correct']}  "
+                f"strict_incorrect: {stats['strict_incorrect']}  "
+                f"strict_correct_pct: {_num(stats['strict_correct_pct'])}"
+            )
+            print(
+                f"meaningful_scored_count: {stats['meaningful_scored_count']}  "
+                f"meaningful_correct: {stats['meaningful_correct']}  "
+                f"meaningful_incorrect: {stats['meaningful_incorrect']}  "
+                f"meaningful_correct_pct: {_num(stats['meaningful_correct_pct'])}"
+            )
         print(
             f"false_candidates: {stats['false_candidates']}  "
             f"missed_opportunities: {stats['missed_opportunities']}"

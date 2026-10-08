@@ -235,6 +235,7 @@ def run_shadow(
     session_now_override: Optional[str] = None,
     session_clock: Optional[Callable[[], datetime]] = None,
     signal_profile: Optional[str] = None,
+    readiness_checks: bool = False,
 ) -> int:
     out = _Output(json_output)
     checks = production_execution_block_checks()
@@ -284,6 +285,7 @@ def run_shadow(
             pause_seconds=pause_seconds,
             followup_seconds=followup_seconds,
             symbols=tuple(s.strip().upper() for s in symbols if s and s.strip()),
+            readiness_checks=readiness_checks,
         ).validate()
     except ConfigurationError as exc:
         return _fail(out, "config", str(exc), exit_code=CONFIG_EXIT_CODE)
@@ -378,7 +380,17 @@ def run_shadow(
         out.line("warning: outside regular US market hours; expect stale-data SKIP decisions")
 
     def on_event(kind: str, payload: Dict[str, Any]) -> None:
-        if kind == "cycle_start":
+        if kind == "warmup_started":
+            out.line("warmup_started")
+        elif kind == "warmup_symbols_ready":
+            out.line("warmup_symbols_ready")
+        elif kind == "warmup_complete":
+            out.line(f"warmup_seconds: {payload['seconds']}")
+        elif kind == "warmup_failed":
+            out.line(f"warmup_failed_reason: {payload['reason']}")
+        elif kind == "stream_reconnect_due_to_stale_feed":
+            out.line("stream_reconnect_due_to_stale_feed")
+        elif kind == "cycle_start":
             out.line(f"--- cycle {payload['cycle']}/{payload['cycles']} ---")
         elif kind == "session":
             decision: SessionGuardDecision = payload["session"]
@@ -532,6 +544,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_minutes_before_close=args.min_minutes_before_close,
         session_now_override=args.session_now_override,
         signal_profile=args.signal_profile,
+        readiness_checks=True,
     )
 
 
