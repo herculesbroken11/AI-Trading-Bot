@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from backend.signals.models import MarketSnapshot, SignalDecision, SignalDirection
+from backend.signals.predictive_continuation import evaluate_predictive_continuation
 
 TRACKED_SYMBOLS = ("TNA", "TZA", "IWM", "SPY", "QQQ")
 FOLLOWUP_MAX_QUOTE_AGE_SECONDS = 5.0
@@ -36,6 +37,14 @@ def pct_move(before: Optional[float], after: Optional[float]) -> Optional[float]
 def _mid(snapshot: Optional[MarketSnapshot], symbol: str) -> Optional[float]:
     quote = snapshot.get(symbol) if snapshot else None
     return quote.mid if quote else None
+
+
+def _predictive_payload(decision: SignalDecision, snapshot: MarketSnapshot) -> Optional[Dict[str, Any]]:
+    """Analytics on an existing candidate. Skip cycles produce no prediction."""
+    if decision.decision is SignalDirection.SKIP or decision.selected_symbol not in ("TNA", "TZA"):
+        return None
+    result = evaluate_predictive_continuation(snapshot, decision.selected_symbol)
+    return None if result is None else result.to_dict()
 
 
 def _age(snapshot: Optional[MarketSnapshot], symbol: str) -> Optional[float]:
@@ -167,6 +176,7 @@ class ShadowCycleRecord:
     submitted: bool = False
     production_execution_blocked: bool = True
     profile_scores: Optional[Dict[str, Any]] = None
+    predictive_continuation: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.assert_safe()
@@ -197,6 +207,9 @@ class ShadowCycleRecord:
         }
         if profile_scores is not None:
             score_payload["profile_scores"] = profile_scores
+        predictive = _predictive_payload(decision, snapshot)
+        if predictive is not None:
+            score_payload["predictive_continuation"] = predictive
         return cls(
             run_id=run_id,
             cycle_number=cycle_number,
@@ -217,6 +230,7 @@ class ShadowCycleRecord:
             raw_score_json=json.dumps(score_payload, sort_keys=True, default=str),
             warnings=list(decision.warnings),
             profile_scores=profile_scores,
+            predictive_continuation=predictive,
         )
 
     def apply_followup(self, outcome: FollowupOutcome) -> None:
@@ -252,6 +266,16 @@ class ShadowCycleRecord:
         }
         if self.profile_scores is not None:
             data["profile_scores"] = dict(self.profile_scores)
+        predictive = self.predictive_continuation or {}
+        data["predictive_continuation_probability"] = predictive.get("continuation_probability")
+        data["momentum_phase"] = predictive.get("momentum_phase")
+        data["acceleration_score"] = predictive.get("acceleration_score")
+        data["velocity_score"] = predictive.get("velocity_score")
+        data["exhaustion_score"] = predictive.get("exhaustion_score")
+        data["reversal_risk_score"] = predictive.get("reversal_risk_score")
+        data["prediction_passed"] = predictive.get("prediction_passed")
+        if self.predictive_continuation is not None:
+            data["predictive_continuation"] = dict(self.predictive_continuation)
         if self.followup is not None:
             data.update(self.followup.to_dict())
         else:

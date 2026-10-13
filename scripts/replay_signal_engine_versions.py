@@ -18,6 +18,10 @@ Checkpoint 2.17A: --signal-profile balanced_v3_shadow or both replays stored
 snapshots through the shadow-only candidate engine. --session-date filters
 rows by UTC date or run id, for example 2026-10-06,2026-10-07.
 
+Checkpoint 2.20: --predictive-continuation compares stored TNA/TZA candidates
+with the same candidates after the shadow-only continuation filter. It does
+not change engine thresholds or submit orders.
+
 Exit codes:
   0 comparison printed (also when there are no rows)
   2 configuration / database / unsafe arguments
@@ -42,6 +46,7 @@ from backend.config.tastytrade_urls import SANDBOX_BASE_URL
 from backend.market_data.config import MarketDataConfigError, validate_execution_still_sandbox
 from backend.shadow_mode.analytics import DEFAULT_MIN_FOLLOWUP_MOVE_PCT, load_rows
 from backend.shadow_mode.engine_replay import REPLAY_LABEL, compare_engine_versions
+from backend.shadow_mode.predictive_replay import compare_predictive_continuation
 from backend.shadow_mode.profile_replay import (
     compare_signal_profiles,
     parse_profile_selection,
@@ -271,6 +276,23 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
     print("orders_submitted: 0  writes_to_database: false  applied_to_live: false")
 
 
+def _print_predictive(report: Dict[str, Any]) -> None:
+    print("--- predictive continuation analysis ---")
+    print(f"candidate_count: {report['candidate_count']}")
+    print(f"correct_candidates: {report['correct_candidates']}")
+    print(f"incorrect_candidates: {report['incorrect_candidates']}")
+    print(f"passed_predictions: {report['passed_predictions']}")
+    print(f"failed_predictions: {report['failed_predictions']}")
+    print(f"accuracy_before_prediction: {_num(report['accuracy_before_prediction'])}")
+    print(f"accuracy_after_prediction: {_num(report['accuracy_after_prediction'])}")
+    print(f"false_signals_removed: {report['false_signals_removed']}")
+    print(f"good_signals_removed: {report['good_signals_removed']}")
+    print(f"missed_winners: {report['missed_winners']}")
+    print("orders_submitted: 0")
+    print("writes_to_database: false")
+    print("analytics_only: true")
+
+
 def _parse_session_dates(raw: Optional[str]) -> Optional[List[str]]:
     if not raw or not str(raw).strip():
         return None
@@ -306,6 +328,7 @@ def run_replay(
     rows_loader: Optional[RowsLoader] = None,
     signal_profile: Optional[str] = None,
     session_dates: Optional[str] = None,
+    predictive_continuation: bool = False,
 ) -> int:
     try:
         variant_names = parse_variants(variants)
@@ -349,6 +372,9 @@ def run_replay(
     variant_report = (
         compare_variants(rows, variant_names, min_move_pct=min_followup_move_pct) if variant_names else None
     )
+    predictive_report = (
+        compare_predictive_continuation(rows, min_move_pct=min_followup_move_pct) if predictive_continuation else None
+    )
     execution = {
         "trading_mode": settings.trading_mode,
         "tastytrade_env": settings.tastytrade_env,
@@ -374,6 +400,8 @@ def run_replay(
             "live_signal_logic_unchanged": True,
             "note": REPLAY_LABEL if variant_report is None else f"{REPLAY_LABEL}; variants: {DIAGNOSTIC_NOTE}",
         }
+        if predictive_report is not None:
+            doc["predictive_continuation"] = predictive_report
         print(json.dumps(doc, indent=2, sort_keys=True, default=str))
         return 0
 
@@ -391,6 +419,8 @@ def run_replay(
     if variant_report is not None:
         _print_variants(variant_report)
         print(f"note: {DIAGNOSTIC_NOTE}")
+    if predictive_report is not None:
+        _print_predictive(predictive_report)
     print(f"note: {REPLAY_LABEL}")
     return 0
 
@@ -420,6 +450,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="comma-separated UTC session dates to replay, e.g. 2026-10-06,2026-10-07",
     )
     parser.add_argument(
+        "--predictive-continuation",
+        action="store_true",
+        help="analytics only: compare stored TNA/TZA candidates before and after the continuation filter",
+    )
+    parser.add_argument(
         "--variants",
         default=None,
         help="DIAGNOSTIC ONLY replay variants: all, or a comma list of current_v2, allow_smallcap_divergence_strict, "
@@ -441,6 +476,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         variants=args.variants,
         signal_profile=args.signal_profile,
         session_dates=args.session_date,
+        predictive_continuation=args.predictive_continuation,
     )
 
 

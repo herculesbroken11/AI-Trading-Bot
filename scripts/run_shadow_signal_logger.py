@@ -62,6 +62,7 @@ from backend.shadow_mode.runner import (
 )
 from backend.signals.dxlink_signal_source import DEFAULT_SIGNAL_SYMBOLS, StreamFactory
 from backend.signals.models import SIGNAL_ENGINE_VERSION
+from backend.signals.predictive_continuation import PredictiveContinuationResult, format_shadow_lines
 from backend.signals.profiles import BALANCED_V3_SHADOW, DEFAULT_SIGNAL_PROFILE, build_shadow_engine, normalize_signal_profile
 
 CONFIG_EXIT_CODE = 2
@@ -162,6 +163,24 @@ def _print_record(out: _Output, record: ShadowCycleRecord) -> None:
                 f"selected_etf_final_10s_move={_num(scores.get('selected_etf_final_10s_move'), '{:+.4f}')} "
                 f"pair_final_10s_confirmation={scores.get('pair_final_10s_confirmation')}"
             )
+    payload = record.predictive_continuation
+    if payload:
+        result = PredictiveContinuationResult(
+            continuation_probability=float(payload["continuation_probability"]),
+            momentum_phase=str(payload["momentum_phase"]),
+            acceleration_score=float(payload["acceleration_score"]),
+            velocity_score=float(payload["velocity_score"]),
+            persistence_score=float(payload["persistence_score"]),
+            exhaustion_score=float(payload["exhaustion_score"]),
+            reversal_risk_score=float(payload["reversal_risk_score"]),
+            prediction_passed=bool(payload["prediction_passed"]),
+            prediction_reason=str(payload["prediction_reason"]),
+        )
+        candidate_score = record.confidence_score
+        if record.profile_scores and record.profile_scores.get("candidate_score") is not None:
+            candidate_score = float(record.profile_scores["candidate_score"])
+        for line in format_shadow_lines(record.selected_symbol or "SKIP", candidate_score, result):
+            out.line(line)
     out.line(f"logged: {'db id=' + str(record.db_id) if record.db_id is not None else 'memory only'}")
     out.line("submitted: false (shadow mode never submits orders)")
 
