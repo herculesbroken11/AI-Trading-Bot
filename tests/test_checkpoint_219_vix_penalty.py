@@ -1,4 +1,4 @@
-"""Checkpoint 2.19 — balanced_v3_shadow treats elevated VIX as a penalty, not a hard skip."""
+"""Checkpoint 2.19 — VIX penalty remains a replay comparison. The shadow default hard-blocks elevated VIX."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from backend.signals.candidate_engine_v3 import (
     VIX_DIAGNOSTIC_HARD_BLOCK,
     VIX_DIAGNOSTIC_PENALTY,
     VIX_POLICY_HARD_BLOCK,
+    VIX_POLICY_PENALTY,
     CandidateEngineV3,
     CandidateEngineV3Config,
 )
@@ -94,21 +95,26 @@ def test_conservative_v2_still_hard_blocks_extreme_vix_only():
     assert rising.confidence_score < calm.confidence_score
 
 
-def test_balanced_profile_penalizes_moderate_vix_change_instead_of_skipping():
-    """Elevated VIX still lowers the score. Without a continuation path it is not a trade.
-
-    The 2026-10-08 midday shadow run kept these names and accuracy fell from 60% to 44.4%.
-    """
+def test_default_shadow_profile_hard_blocks_elevated_vix():
+    """The midday shadow run lost accuracy when elevated VIX was only a score penalty."""
     calm = _v3().decide(snap(*strong_book(vix(16.0, 16.2))))
     rising = _v3().decide(snap(*strong_book(vix(16.0, 15.09))))
     assert calm.decision is SignalDirection.BULLISH
     assert rising.decision is SignalDirection.SKIP
-    assert rising.skip_reason is SignalReason.VIX_CONTINUATION_REQUIRED
+    assert rising.skip_reason is SignalReason.HIGH_VOLATILITY
+    assert rising.profile_scores["vix_diagnostic"] == VIX_DIAGNOSTIC_HARD_BLOCK
+
+
+def test_penalty_policy_still_lowers_the_score_instead_of_skipping():
+    calm = _v3(vix_policy=VIX_POLICY_PENALTY).decide(snap(*strong_book(vix(16.0, 16.2))))
+    rising = _v3(vix_policy=VIX_POLICY_PENALTY).decide(snap(*strong_book(vix(16.0, 15.09))))
+    assert calm.decision is SignalDirection.BULLISH
+    assert rising.decision is SignalDirection.BULLISH
+    assert rising.skip_reason is None
     assert rising.profile_scores["vix_diagnostic"] == VIX_DIAGNOSTIC_PENALTY
     assert rising.profile_scores["vix_score"] < calm.profile_scores["vix_score"]
     assert rising.profile_scores["candidate_score"] < calm.profile_scores["candidate_score"]
     assert rising.profile_scores["candidate_score"] >= 70
-    assert VIX_DIAGNOSTIC_PENALTY in rising.explanation or any(VIX_DIAGNOSTIC_PENALTY in item for item in rising.warnings)
 
 
 def test_balanced_profile_still_hard_blocks_extreme_vix():
@@ -144,13 +150,13 @@ def test_replay_compares_hard_block_with_vix_penalty(capsys):
     current = comparison["balanced_v3_shadow_current"]
     penalty = comparison["balanced_v3_shadow_vix_penalty"]
     assert current["candidate_count"] == 1
-    assert penalty["candidate_count"] == 1
-    assert comparison["candidates_added_by_vix_penalty"] == 0
-    assert comparison["correct_added_by_vix_penalty"] == 0
-    assert comparison["incorrect_added_by_vix_penalty"] == 0
-    assert comparison["vix_blocked_candidates_recovered"] == 0
-    assert comparison["strict_correctness"] == "unchanged"
-    assert penalty["strict_correct_pct"] == current["strict_correct_pct"]
+    assert penalty["candidate_count"] == 3
+    assert comparison["candidates_added_by_vix_penalty"] == 2
+    assert comparison["correct_added_by_vix_penalty"] == 1
+    assert comparison["incorrect_added_by_vix_penalty"] == 1
+    assert comparison["vix_blocked_candidates_recovered"] == 2
+    assert comparison["strict_correctness"] == "worsened"
+    assert penalty["strict_correct_pct"] < current["strict_correct_pct"]
     assert report["profiles"]["balanced_v3_shadow"]["direction_sign_failures"] == 0
     assert report["orders_submitted"] == 0
     assert report["writes_to_database"] is False
@@ -232,7 +238,7 @@ def test_report_includes_vix_diagnostics(capsys):
 def test_balanced_profile_stays_shadow_only_and_routes_stay_blocked(monkeypatch):
     engine = CandidateEngineV3(mode="shadow")
     assert engine.ALLOWS_EXECUTION is False
-    assert CandidateEngineV3Config().vix_policy == "penalty"
+    assert CandidateEngineV3Config().vix_policy == "hard_block"
     with pytest.raises(ConfigurationError, match="shadow/replay only"):
         build_pre_submit_check(MagicMock(), engine=engine, expected=SignalDirection.BULLISH, provider=MagicMock())
     for module in (v3_mod, profile_replay):

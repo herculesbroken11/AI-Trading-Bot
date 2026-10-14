@@ -14,7 +14,7 @@ import backend.signals.tna_tza_signal_engine as v2_mod
 import backend.shadow_mode.predictive_replay as replay_mod
 from backend.shadow_mode.models import ShadowCycleRecord
 from backend.shadow_mode.predictive_replay import compare_predictive_continuation
-from backend.signals.candidate_engine_v3 import CandidateEngineV3, CandidateEngineV3Config, VIX_DIAGNOSTIC_PENALTY
+from backend.signals.candidate_engine_v3 import CandidateEngineV3, CandidateEngineV3Config
 from backend.signals.models import MarketSnapshot, SignalDecision, SignalDirection, SignalReason, SymbolQuote
 from backend.signals.predictive_continuation import (
     PHASE_DEVELOPING,
@@ -360,39 +360,33 @@ def test_existing_engines_are_unchanged():
     assert decision.confidence_score >= 70
     assert SignalEngineConfig().entry_score_threshold == 70.0
     assert CandidateEngineV3Config().entry_score_threshold == 70.0
-    assert CandidateEngineV3Config().vix_policy == "penalty"
+    assert CandidateEngineV3Config().vix_policy == "hard_block"
     assert "predictive_continuation" not in inspect.getsource(v2_mod)
     assert "order_executor" not in inspect.getsource(v3_mod)
 
 
-def test_shadow_engine_skips_exhausted_candidates_and_keeps_accelerating_ones():
+def test_continuation_stays_analytics_unless_explicitly_enabled():
+    """The midday run removed 2 winners and 1 loser, so the gate is off by default."""
     engine = CandidateEngineV3(mode="shadow")
     kept = engine.decide(strong_accel())
     faded = engine.decide(exhausted())
     assert kept.decision is SignalDirection.BULLISH
-    assert kept.selected_symbol == "TNA"
-    assert faded.decision is SignalDirection.SKIP
-    assert faded.skip_reason is SignalReason.MOMENTUM_EXHAUSTION
-    unfiltered = engine.decide(exhausted(), apply_continuation_filter=False)
-    assert unfiltered.decision is SignalDirection.BULLISH
-    assert unfiltered.confidence_score > kept.confidence_score
+    assert faded.decision is SignalDirection.BULLISH
+    assert faded.confidence_score > kept.confidence_score
+    skipped = engine.decide(exhausted(), apply_continuation_filter=True)
+    assert skipped.decision is SignalDirection.SKIP
+    assert skipped.skip_reason is SignalReason.MOMENTUM_EXHAUSTION
 
 
-def test_elevated_vix_needs_a_passing_continuation_path():
+def test_default_shadow_hard_blocks_elevated_vix_even_with_a_strong_path():
     from tests.test_checkpoint_217a_balanced_shadow_profile import vix
 
     engine = CandidateEngineV3(mode="shadow")
-    calm = engine.decide(strong_accel())
     rising_quotes = list(strong_accel().quotes.values())
     rising_quotes.append(vix(16.0, 15.09))
     rising = engine.decide(snap(*rising_quotes))
-    assert calm.decision is SignalDirection.BULLISH
-    assert rising.decision is SignalDirection.BULLISH
-    assert rising.profile_scores["vix_diagnostic"] == VIX_DIAGNOSTIC_PENALTY
-    assert rising.profile_scores["candidate_score"] < calm.profile_scores["candidate_score"]
-    bare = engine.decide(profile_snap(*window_bull(), vix(16.0, 15.09)))
-    assert bare.decision is SignalDirection.SKIP
-    assert bare.skip_reason is SignalReason.VIX_CONTINUATION_REQUIRED
+    assert rising.decision is SignalDirection.SKIP
+    assert rising.skip_reason is SignalReason.HIGH_VOLATILITY
 
 
 def test_replay_filters_balanced_candidates_not_only_stored_decisions():

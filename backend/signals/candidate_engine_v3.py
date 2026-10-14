@@ -107,9 +107,10 @@ class CandidateEngineV3Config:
     adaptive_entry_floor: float = 65.0
     # Mid-window is diagnostic only. Late reversal uses the final 10 seconds.
     mid_persist_fraction: float = 0.5
-    # penalty: elevated VIX change or a high-but-not-extreme level lowers vix_score.
-    # hard_block: the pre-2.19 behavior, kept for replay comparison only.
-    vix_policy: str = VIX_POLICY_PENALTY
+    # hard_block: elevated VIX skips the candidate. The 2026-10-08 midday run
+    # showed the penalty policy added 3 losers and 1 winner (44.4% vs 60%).
+    # penalty remains available for replay comparison only.
+    vix_policy: str = VIX_POLICY_HARD_BLOCK
 
     def validate(self) -> "CandidateEngineV3Config":
         problems: List[str] = []
@@ -469,7 +470,7 @@ class CandidateEngineV3:
         *,
         previous_direction: Any = _OMITTED,
         apply_path_filters: bool = True,
-        apply_continuation_filter: bool = True,
+        apply_continuation_filter: bool = False,
     ) -> SignalDecision:
         cfg = self._config
         created_at = self._wall_clock()

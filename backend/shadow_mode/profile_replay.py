@@ -84,7 +84,7 @@ def replay_profile_row(
     *,
     previous_direction: Optional[str] = None,
     apply_path_filters: bool = True,
-    apply_continuation_filter: bool = True,
+    apply_continuation_filter: bool = False,
     vix_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One hypothetical decision. Does not mutate the row."""
