@@ -47,6 +47,7 @@ from backend.market_data.config import MarketDataConfigError, validate_execution
 from backend.shadow_mode.analytics import DEFAULT_MIN_FOLLOWUP_MOVE_PCT, load_rows
 from backend.shadow_mode.engine_replay import REPLAY_LABEL, compare_engine_versions
 from backend.shadow_mode.predictive_replay import compare_predictive_continuation
+from backend.signals.profiles import BALANCED_V3_SHADOW
 from backend.shadow_mode.profile_replay import (
     compare_signal_profiles,
     parse_profile_selection,
@@ -278,6 +279,7 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
 
 def _print_predictive(report: Dict[str, Any]) -> None:
     print("--- predictive continuation analysis ---")
+    print(f"candidate_source: {report.get('candidate_source', 'stored_decisions')}")
     print(f"candidate_count: {report['candidate_count']}")
     print(f"correct_candidates: {report['correct_candidates']}")
     print(f"incorrect_candidates: {report['incorrect_candidates']}")
@@ -372,8 +374,15 @@ def run_replay(
     variant_report = (
         compare_variants(rows, variant_names, min_move_pct=min_followup_move_pct) if variant_names else None
     )
+    predictive_profile = BALANCED_V3_SHADOW if BALANCED_V3_SHADOW in profile_names else None
     predictive_report = (
-        compare_predictive_continuation(rows, min_move_pct=min_followup_move_pct) if predictive_continuation else None
+        compare_predictive_continuation(
+            rows,
+            min_move_pct=min_followup_move_pct,
+            profile=predictive_profile,
+        )
+        if predictive_continuation
+        else None
     )
     execution = {
         "trading_mode": settings.trading_mode,
@@ -452,7 +461,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--predictive-continuation",
         action="store_true",
-        help="analytics only: compare stored TNA/TZA candidates before and after the continuation filter",
+        help="analytics only: filter balanced_v3_shadow candidates when that profile is selected, "
+        "otherwise filter stored TNA/TZA decisions",
     )
     parser.add_argument(
         "--variants",

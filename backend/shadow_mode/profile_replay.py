@@ -84,6 +84,7 @@ def replay_profile_row(
     *,
     previous_direction: Optional[str] = None,
     apply_path_filters: bool = True,
+    apply_continuation_filter: bool = True,
     vix_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One hypothetical decision. Does not mutate the row."""
@@ -112,6 +113,7 @@ def replay_profile_row(
                 snapshot,
                 previous_direction=previous_direction,
                 apply_path_filters=apply_path_filters,
+                apply_continuation_filter=apply_continuation_filter,
             )
     except (KeyError, TypeError, ValueError) as exc:
         return {"replayed": False, "reason": f"snapshot replay failed ({type(exc).__name__})", "profile": selected}

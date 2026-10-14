@@ -14,7 +14,7 @@ import backend.signals.tna_tza_signal_engine as v2_mod
 import backend.shadow_mode.predictive_replay as replay_mod
 from backend.shadow_mode.models import ShadowCycleRecord
 from backend.shadow_mode.predictive_replay import compare_predictive_continuation
-from backend.signals.candidate_engine_v3 import CandidateEngineV3, CandidateEngineV3Config
+from backend.signals.candidate_engine_v3 import CandidateEngineV3, CandidateEngineV3Config, VIX_DIAGNOSTIC_PENALTY
 from backend.signals.models import MarketSnapshot, SignalDecision, SignalDirection, SignalReason, SymbolQuote
 from backend.signals.predictive_continuation import (
     PHASE_DEVELOPING,
@@ -358,14 +358,64 @@ def test_existing_engines_are_unchanged():
     decision = CandidateEngineV3(mode="shadow").decide(profile_snap(*window_bull()))
     assert decision.decision is SignalDirection.BULLISH
     assert decision.confidence_score >= 70
-    assert "predictive_continuation" not in (decision.profile_scores or {})
     assert SignalEngineConfig().entry_score_threshold == 70.0
     assert CandidateEngineV3Config().entry_score_threshold == 70.0
     assert CandidateEngineV3Config().vix_policy == "penalty"
-    for module in (v2_mod, v3_mod):
-        source = inspect.getsource(module)
-        assert "predictive_continuation" not in source
-        assert "evaluate_predictive_continuation" not in source
+    assert "predictive_continuation" not in inspect.getsource(v2_mod)
+    assert "order_executor" not in inspect.getsource(v3_mod)
+
+
+def test_shadow_engine_skips_exhausted_candidates_and_keeps_accelerating_ones():
+    engine = CandidateEngineV3(mode="shadow")
+    kept = engine.decide(strong_accel())
+    faded = engine.decide(exhausted())
+    assert kept.decision is SignalDirection.BULLISH
+    assert kept.selected_symbol == "TNA"
+    assert faded.decision is SignalDirection.SKIP
+    assert faded.skip_reason is SignalReason.MOMENTUM_EXHAUSTION
+    unfiltered = engine.decide(exhausted(), apply_continuation_filter=False)
+    assert unfiltered.decision is SignalDirection.BULLISH
+    assert unfiltered.confidence_score > kept.confidence_score
+
+
+def test_elevated_vix_needs_a_passing_continuation_path():
+    from tests.test_checkpoint_217a_balanced_shadow_profile import vix
+
+    engine = CandidateEngineV3(mode="shadow")
+    calm = engine.decide(strong_accel())
+    rising_quotes = list(strong_accel().quotes.values())
+    rising_quotes.append(vix(16.0, 15.09))
+    rising = engine.decide(snap(*rising_quotes))
+    assert calm.decision is SignalDirection.BULLISH
+    assert rising.decision is SignalDirection.BULLISH
+    assert rising.profile_scores["vix_diagnostic"] == VIX_DIAGNOSTIC_PENALTY
+    assert rising.profile_scores["candidate_score"] < calm.profile_scores["candidate_score"]
+    bare = engine.decide(profile_snap(*window_bull(), vix(16.0, 15.09)))
+    assert bare.decision is SignalDirection.SKIP
+    assert bare.skip_reason is SignalReason.VIX_CONTINUATION_REQUIRED
+
+
+def test_replay_filters_balanced_candidates_not_only_stored_decisions():
+    winner = _stored(strong_accel(), decision="skip", symbol=None, tna_after_pct=0.12, iwm_after_pct=0.12, cycle=1)
+    false_signal = _stored(exhausted(), decision="skip", symbol=None, tna_after_pct=-0.12, iwm_after_pct=-0.12, cycle=2)
+    report = compare_predictive_continuation(
+        [winner, false_signal],
+        min_move_pct=0.03,
+        profile="balanced_v3_shadow",
+    )
+    assert report["candidate_source"] == "balanced_v3_shadow"
+    assert report["candidate_count"] == 2
+    assert report["correct_candidates"] == 1
+    assert report["incorrect_candidates"] == 1
+    assert report["passed_predictions"] == 1
+    assert report["failed_predictions"] == 1
+    assert report["false_signals_removed"] == 1
+    assert report["good_signals_removed"] == 0
+    assert report["accuracy_before_prediction"] == 50.0
+    assert report["accuracy_after_prediction"] == 100.0
+    assert report["orders_submitted"] == 0
+    assert report["writes_to_database"] is False
+    assert report["analytics_only"] is True
 
 
 @pytest.mark.parametrize("module", [predictive_mod, replay_mod])

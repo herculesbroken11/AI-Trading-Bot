@@ -95,11 +95,15 @@ def test_conservative_v2_still_hard_blocks_extreme_vix_only():
 
 
 def test_balanced_profile_penalizes_moderate_vix_change_instead_of_skipping():
+    """Elevated VIX still lowers the score. Without a continuation path it is not a trade.
+
+    The 2026-10-08 midday shadow run kept these names and accuracy fell from 60% to 44.4%.
+    """
     calm = _v3().decide(snap(*strong_book(vix(16.0, 16.2))))
     rising = _v3().decide(snap(*strong_book(vix(16.0, 15.09))))
     assert calm.decision is SignalDirection.BULLISH
-    assert rising.decision is SignalDirection.BULLISH
-    assert rising.skip_reason is None
+    assert rising.decision is SignalDirection.SKIP
+    assert rising.skip_reason is SignalReason.VIX_CONTINUATION_REQUIRED
     assert rising.profile_scores["vix_diagnostic"] == VIX_DIAGNOSTIC_PENALTY
     assert rising.profile_scores["vix_score"] < calm.profile_scores["vix_score"]
     assert rising.profile_scores["candidate_score"] < calm.profile_scores["candidate_score"]
@@ -140,13 +144,13 @@ def test_replay_compares_hard_block_with_vix_penalty(capsys):
     current = comparison["balanced_v3_shadow_current"]
     penalty = comparison["balanced_v3_shadow_vix_penalty"]
     assert current["candidate_count"] == 1
-    assert penalty["candidate_count"] == 3
-    assert comparison["candidates_added_by_vix_penalty"] == 2
-    assert comparison["correct_added_by_vix_penalty"] == 1
-    assert comparison["incorrect_added_by_vix_penalty"] == 1
-    assert comparison["vix_blocked_candidates_recovered"] == 2
-    assert comparison["strict_correctness"] == "worsened"
-    assert penalty["strict_correct_pct"] < current["strict_correct_pct"]
+    assert penalty["candidate_count"] == 1
+    assert comparison["candidates_added_by_vix_penalty"] == 0
+    assert comparison["correct_added_by_vix_penalty"] == 0
+    assert comparison["incorrect_added_by_vix_penalty"] == 0
+    assert comparison["vix_blocked_candidates_recovered"] == 0
+    assert comparison["strict_correctness"] == "unchanged"
+    assert penalty["strict_correct_pct"] == current["strict_correct_pct"]
     assert report["profiles"]["balanced_v3_shadow"]["direction_sign_failures"] == 0
     assert report["orders_submitted"] == 0
     assert report["writes_to_database"] is False

@@ -28,6 +28,10 @@ from backend.signals.models import (
     SignalScoreBreakdown,
     SymbolQuote,
 )
+from backend.signals.predictive_continuation import (
+    continuation_entry_block,
+    evaluate_predictive_continuation,
+)
 from backend.signals.profiles import BALANCED_V3_SHADOW, PROFILE_SCORE_FIELDS
 from backend.signals.tna_tza_signal_engine import SignalEngineConfig, TnaTzaSignalEngine
 
@@ -465,6 +469,7 @@ class CandidateEngineV3:
         *,
         previous_direction: Any = _OMITTED,
         apply_path_filters: bool = True,
+        apply_continuation_filter: bool = True,
     ) -> SignalDecision:
         cfg = self._config
         created_at = self._wall_clock()
@@ -635,6 +640,12 @@ class CandidateEngineV3:
             chosen = eligible[0]
         if chosen is not None:
             blocked = self._confirmation_block(chosen, apply_path_filters=apply_path_filters, previous=remembered)
+            if blocked is None and apply_path_filters and apply_continuation_filter:
+                blocked = self._continuation_block(
+                    snapshot,
+                    chosen,
+                    vix_penalty=vix_state.get("diagnostic") == VIX_DIAGNOSTIC_PENALTY,
+                )
             if blocked is None:
                 return self._candidate(finish, chosen, bull, bear, warnings)
             reason, detail = blocked
@@ -905,6 +916,29 @@ class CandidateEngineV3:
                 f"after a {previous} cycle",
             )
         return None
+
+    def _continuation_block(
+        self,
+        snapshot: MarketSnapshot,
+        side: _SideScore,
+        *,
+        vix_penalty: bool,
+    ) -> Optional[Tuple[SignalReason, str]]:
+        """Drop a candidate whose path says the move is unlikely to continue.
+
+        Shadow and replay only. This does not create a candidate and does not
+        run for conservative_v2.
+        """
+        symbol = "TNA" if side.direction == 1 else "TZA"
+        result = evaluate_predictive_continuation(snapshot, symbol)
+        blocked = continuation_entry_block(result, vix_penalty=vix_penalty)
+        if blocked is None or result is None:
+            return None
+        code, detail = blocked
+        side.metrics["continuation_probability"] = result.continuation_probability
+        side.metrics["momentum_phase"] = result.momentum_phase
+        side.metrics["prediction_passed"] = result.prediction_passed
+        return SignalReason(code), detail
 
     def _breakdown(self, bull: _SideScore, bear: _SideScore) -> SignalScoreBreakdown:
         breakdown = SignalScoreBreakdown()

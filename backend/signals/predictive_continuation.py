@@ -504,6 +504,34 @@ def _fmt_score(value: Optional[float]) -> str:
     return f"{rounded:.1f}"
 
 
+def continuation_entry_block(result: Optional[PredictiveContinuationResult], *, vix_penalty: bool) -> Optional[tuple]:
+    """Whether an existing candidate should be skipped.
+
+    A missing path does not block a calm candidate. Elevated VIX is different:
+    the 2026-10-08 shadow run added mostly losing trades when those names were
+    kept without proof the move was still continuing. Exhaustion and reversal
+    are skipped whenever the path was long enough to measure them.
+
+    Returns None to keep the candidate, or (reason_code, explanation) to skip.
+    """
+    if result is None:
+        return None
+    if result.prediction_reason == REASON_INSUFFICIENT:
+        if vix_penalty:
+            return (
+                "vix_continuation_required",
+                "elevated VIX and no measurable continuation path",
+            )
+        return None
+    if result.prediction_passed:
+        return None
+    if result.momentum_phase == PHASE_REVERSAL_RISK:
+        return ("reversal_risk", f"final path reversed ({result.continuation_probability:g})")
+    if result.momentum_phase == PHASE_EXHAUSTION:
+        return ("momentum_exhaustion", f"momentum faded ({result.continuation_probability:g})")
+    return ("weak_continuation", f"continuation {result.continuation_probability:g} below the pass line")
+
+
 def format_shadow_lines(
     symbol: str,
     candidate_score: Optional[float],
