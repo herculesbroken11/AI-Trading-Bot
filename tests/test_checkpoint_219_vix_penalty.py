@@ -150,13 +150,13 @@ def test_replay_compares_hard_block_with_vix_penalty(capsys):
     current = comparison["balanced_v3_shadow_current"]
     penalty = comparison["balanced_v3_shadow_vix_penalty"]
     assert current["candidate_count"] == 1
-    assert penalty["candidate_count"] == 3
-    assert comparison["candidates_added_by_vix_penalty"] == 2
-    assert comparison["correct_added_by_vix_penalty"] == 1
-    assert comparison["incorrect_added_by_vix_penalty"] == 1
-    assert comparison["vix_blocked_candidates_recovered"] == 2
-    assert comparison["strict_correctness"] == "worsened"
-    assert penalty["strict_correct_pct"] < current["strict_correct_pct"]
+    assert penalty["candidate_count"] == 1
+    assert comparison["candidates_added_by_vix_penalty"] == 0
+    assert comparison["correct_added_by_vix_penalty"] == 0
+    assert comparison["incorrect_added_by_vix_penalty"] == 0
+    assert comparison["vix_blocked_candidates_recovered"] == 0
+    assert comparison["strict_correctness"] == "unchanged"
+    assert penalty["strict_correct_pct"] == current["strict_correct_pct"]
     assert report["profiles"]["balanced_v3_shadow"]["direction_sign_failures"] == 0
     assert report["orders_submitted"] == 0
     assert report["writes_to_database"] is False

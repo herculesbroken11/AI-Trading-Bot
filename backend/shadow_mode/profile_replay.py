@@ -83,6 +83,7 @@ def replay_profile_row(
     profile: str,
     *,
     previous_direction: Optional[str] = None,
+    last_taken_direction: Optional[str] = None,
     apply_path_filters: bool = True,
     apply_continuation_filter: bool = False,
     vix_policy: Optional[str] = None,
@@ -112,6 +113,7 @@ def replay_profile_row(
             decision = engine.decide(
                 snapshot,
                 previous_direction=previous_direction,
+                last_taken_direction=last_taken_direction,
                 apply_path_filters=apply_path_filters,
                 apply_continuation_filter=apply_continuation_filter,
             )
@@ -156,6 +158,20 @@ def _example(item: Mapping[str, Any], kind: str) -> Dict[str, Any]:
     }
 
 
+def _remember_direction(
+    previous_by_run: Dict[str, Optional[str]],
+    last_taken_by_run: Dict[str, Optional[str]],
+    run_id: str,
+    decision: Optional[str],
+) -> None:
+    """Flip cooldown clears on a skip. The one-entry lock stays until the other side is taken."""
+    if decision in TRADE_DECISIONS:
+        previous_by_run[run_id] = decision
+        last_taken_by_run[run_id] = decision
+    else:
+        previous_by_run[run_id] = None
+
+
 def summarize_profile(
     rows: Sequence[Mapping[str, Any]],
     profile: str,
@@ -166,13 +182,16 @@ def summarize_profile(
     selected = normalize_signal_profile(profile)
     items: List[Dict[str, Any]] = []
     previous_by_run: Dict[str, Optional[str]] = {}
+    last_taken_by_run: Dict[str, Optional[str]] = {}
     for row in _ordered_rows(rows):
         run_id = str(row.get("run_id") or "")
         previous = previous_by_run.get(run_id) if selected == BALANCED_V3_SHADOW else None
+        last_taken = last_taken_by_run.get(run_id) if selected == BALANCED_V3_SHADOW else None
         replayed = replay_profile_row(
             row,
             selected,
             previous_direction=previous,
+            last_taken_direction=last_taken,
             apply_path_filters=True,
             vix_policy=vix_policy,
         )
@@ -194,7 +213,7 @@ def summarize_profile(
             }
         )
         if selected == BALANCED_V3_SHADOW:
-            previous_by_run[run_id] = decision if decision in TRADE_DECISIONS else None
+            _remember_direction(previous_by_run, last_taken_by_run, run_id, decision)
 
     candidates = [item for item in items if item["decision"] in TRADE_DECISIONS]
     scored = [item for item in candidates if item["correct"] is not None]
@@ -282,9 +301,10 @@ def confirmation_comparison(
 ) -> Dict[str, Any]:
     """Before/after path and flip filters. Sign, momentum tiers, and adaptive entry apply to both passes."""
     previous_by_run: Dict[str, Optional[str]] = {}
+    last_taken_by_run: Dict[str, Optional[str]] = {}
     before_count = after_count = 0
     false_filtered = good_preserved = missed_winners = 0
-    sign_failures = late_reversals = flip_cooldowns = 0
+    sign_failures = late_reversals = flip_cooldowns = same_direction = 0
     iwm_rejected = adaptive_rejected = 0
     before_flags: List[Optional[bool]] = []
     after_flags: List[Optional[bool]] = []
@@ -295,6 +315,7 @@ def confirmation_comparison(
             row,
             BALANCED_V3_SHADOW,
             previous_direction=previous_by_run.get(run_id),
+            last_taken_direction=last_taken_by_run.get(run_id),
             apply_path_filters=True,
         )
         before_decision = before.get("decision") if before.get("replayed") else SKIP
@@ -311,6 +332,8 @@ def confirmation_comparison(
             late_reversals += 1
         if after.get("skip_reason") == "direction_flip_cooldown":
             flip_cooldowns += 1
+        if after.get("skip_reason") == "same_direction_reentry":
+            same_direction += 1
         stage = (after.get("profile_scores") or {}).get("rejection_stage")
         if stage == "iwm_threshold":
             iwm_rejected += 1
@@ -323,7 +346,7 @@ def confirmation_comparison(
             good_preserved += 1
         if before_decision in TRADE_DECISIONS and before_correct is True and after_decision == SKIP:
             missed_winners += 1
-        previous_by_run[run_id] = after_decision if after_decision in TRADE_DECISIONS else None
+        _remember_direction(previous_by_run, last_taken_by_run, run_id, after_decision)
     return {
         "candidates_before_filters": before_count,
         "candidates_after_filters": after_count,
@@ -338,6 +361,7 @@ def confirmation_comparison(
         "direction_sign_failures": sign_failures,
         "late_reversal_risk_count": late_reversals,
         "direction_flip_cooldown_count": flip_cooldowns,
+        "same_direction_reentry_count": same_direction,
     }
 
 
@@ -403,12 +427,14 @@ def _profile_decisions(
 ) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     previous_by_run: Dict[str, Optional[str]] = {}
+    last_taken_by_run: Dict[str, Optional[str]] = {}
     for row in _ordered_rows(rows):
         run_id = str(row.get("run_id") or "")
         replayed = replay_profile_row(
             row,
             BALANCED_V3_SHADOW,
             previous_direction=previous_by_run.get(run_id),
+            last_taken_direction=last_taken_by_run.get(run_id),
             apply_path_filters=True,
             vix_policy=vix_policy,
         )
@@ -420,7 +446,7 @@ def _profile_decisions(
                 "correct": score_strict_direction(str(decision), row),
             }
         )
-        previous_by_run[run_id] = decision if decision in TRADE_DECISIONS else None
+        _remember_direction(previous_by_run, last_taken_by_run, run_id, decision)
     return items
 
 

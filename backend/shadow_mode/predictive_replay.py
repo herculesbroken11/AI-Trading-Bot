@@ -16,7 +16,7 @@ import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from backend.shadow_mode.analytics import score_hypothetical, score_strict_direction
-from backend.shadow_mode.profile_replay import _ordered_rows, replay_profile_row
+from backend.shadow_mode.profile_replay import _ordered_rows, _remember_direction, replay_profile_row
 from backend.signals.models import MarketSnapshot
 from backend.signals.predictive_continuation import (
     ANALYTICS_ONLY,
@@ -154,16 +154,18 @@ def _compare_balanced_candidates(rows: Sequence[Mapping[str, Any]], *, min_move_
     before_flags: List[Optional[bool]] = []
     after_flags: List[Optional[bool]] = []
     previous_by_run: Dict[str, Optional[str]] = {}
+    last_taken_by_run: Dict[str, Optional[str]] = {}
     for row in _ordered_rows(rows):
         run_id = str(row.get("run_id") or "")
         before = replay_profile_row(
             row,
             BALANCED_V3_SHADOW,
             previous_direction=previous_by_run.get(run_id),
+            last_taken_direction=last_taken_by_run.get(run_id),
             apply_continuation_filter=False,
         )
         decision = str(before.get("decision") or "skip") if before.get("replayed") else "skip"
-        previous_by_run[run_id] = decision if decision in TRADE_DECISIONS else None
+        _remember_direction(previous_by_run, last_taken_by_run, run_id, decision)
         symbol = before.get("selected_symbol")
         if decision not in TRADE_DECISIONS or symbol not in {"TNA", "TZA"}:
             continue

@@ -452,15 +452,21 @@ class CandidateEngineV3:
         self._config = (config or CandidateEngineV3Config()).validate()
         self._wall_clock = wall_clock
         self._previous_direction: Optional[str] = None
+        self._last_taken_direction: Optional[str] = None
 
     @property
     def config(self) -> CandidateEngineV3Config:
         return self._config
 
     def note_shadow_cycle(self, decision: SignalDecision) -> None:
-        """Remember the last logged shadow candidate so the next cycle can apply the flip cooldown."""
+        """Remember the last logged shadow candidate so the next cycle can apply the flip cooldown.
+
+        A skip clears the flip memory. The last taken side stays until the other
+        side is actually taken, so a second entry into the same swing is blocked.
+        """
         if decision.decision in (SignalDirection.BULLISH, SignalDirection.BEARISH):
             self._previous_direction = decision.decision.value
+            self._last_taken_direction = decision.decision.value
         else:
             self._previous_direction = None
 
@@ -469,6 +475,7 @@ class CandidateEngineV3:
         snapshot: MarketSnapshot,
         *,
         previous_direction: Any = _OMITTED,
+        last_taken_direction: Any = _OMITTED,
         apply_path_filters: bool = True,
         apply_continuation_filter: bool = False,
     ) -> SignalDecision:
@@ -609,6 +616,7 @@ class CandidateEngineV3:
         bear = self._score_side(-1, moves, quotes, vix_score)
         lean = bull if (moves["IWM"] or 0.0) > 0 else bear if (moves["IWM"] or 0.0) < 0 else bull
         remembered = self._previous_direction if previous_direction is _OMITTED else previous_direction
+        remembered_taken = self._last_taken_direction if last_taken_direction is _OMITTED else last_taken_direction
         if vix_block is not None:
             return self._skip_side(
                 finish,
@@ -640,7 +648,12 @@ class CandidateEngineV3:
                 )
             chosen = eligible[0]
         if chosen is not None:
-            blocked = self._confirmation_block(chosen, apply_path_filters=apply_path_filters, previous=remembered)
+            blocked = self._confirmation_block(
+                chosen,
+                apply_path_filters=apply_path_filters,
+                previous=remembered,
+                last_taken=remembered_taken,
+            )
             if blocked is None and apply_path_filters and apply_continuation_filter:
                 blocked = self._continuation_block(
                     snapshot,
@@ -890,6 +903,7 @@ class CandidateEngineV3:
         *,
         apply_path_filters: bool,
         previous: Optional[str],
+        last_taken: Optional[str],
     ) -> Optional[Tuple[SignalReason, str]]:
         """Shadow confirmation after a candidate already passed the direction and score gates."""
         raw = side.metrics.get("iwm_window_move_pct")
@@ -905,6 +919,14 @@ class CandidateEngineV3:
                 "late_reversal_risk: the final 10s moved strongly against the candidate "
                 f"(IWM final 10s {_fmt(_as_float(side.metrics.get('final_10s_move')))}, "
                 f"ETF final 10s {_fmt(_as_float(side.metrics.get('selected_etf_final_10s_move')))})",
+            )
+        same_side = (last_taken == SignalDirection.BULLISH.value and side.direction == 1) or (
+            last_taken == SignalDirection.BEARISH.value and side.direction == -1
+        )
+        if same_side:
+            return (
+                SignalReason.SAME_DIRECTION_REENTRY,
+                f"same_direction_reentry: {side.name} already taken; waiting for the other side",
             )
         opposite = (previous == SignalDirection.BULLISH.value and side.direction == -1) or (
             previous == SignalDirection.BEARISH.value and side.direction == 1

@@ -164,8 +164,8 @@ def test_stale_followup_is_not_scored():
 
 
 def test_replay_strict_matches_report_and_meaningful_is_separate(capsys):
-    large = _stored(snap(*window_bull()), run_id="r", cycle=1, iwm_after_pct=0.12, created="2026-10-08T14:00:00")
-    tiny = _stored(snap(*window_bull()), run_id="r", cycle=2, iwm_after_pct=-0.005, created="2026-10-08T14:02:00")
+    large = _stored(snap(*window_bull()), run_id="r-large", cycle=1, iwm_after_pct=0.12, created="2026-10-08T14:00:00")
+    tiny = _stored(snap(*window_bull()), run_id="r-tiny", cycle=2, iwm_after_pct=-0.005, created="2026-10-08T14:02:00")
     rows = [large, tiny]
     stats = compare_signal_profiles(rows, ["balanced_v3_shadow"], min_move_pct=0.03)["profiles"]["balanced_v3_shadow"]
     assert stats["strict_scored_count"] == 2

@@ -46,6 +46,7 @@ class SignalReason(str, Enum):
     # balanced_v3_shadow confirmation only. Never used by conservative_v2.
     LATE_REVERSAL_RISK = "late_reversal_risk"
     DIRECTION_FLIP_COOLDOWN = "direction_flip_cooldown"
+    SAME_DIRECTION_REENTRY = "same_direction_reentry"
     # Shadow income filter (2.20). A candidate already existed; continuation said not to take it.
     MOMENTUM_EXHAUSTION = "momentum_exhaustion"
     REVERSAL_RISK = "reversal_risk"

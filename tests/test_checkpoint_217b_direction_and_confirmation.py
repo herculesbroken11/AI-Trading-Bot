@@ -34,6 +34,7 @@ from tests.test_checkpoint_217a_balanced_shadow_profile import (
     q,
     snap,
     vix,
+    weak_quotes,
     window_bear,
     window_bull,
 )
@@ -213,6 +214,25 @@ def test_direction_flip_requires_a_stronger_score():
     assert stronger.profile_scores["candidate_score"] >= 80
 
 
+def test_same_direction_reentry_waits_for_the_other_side():
+    """A second push in the same direction is the same swing. The midday run's repeats were net negative."""
+    engine = _v3()
+    first = engine.decide(snap(*window_bull()))
+    assert first.selected_symbol == "TNA"
+    engine.note_shadow_cycle(first)
+    repeat = engine.decide(snap(*window_bull()))
+    assert repeat.decision is SignalDirection.SKIP
+    assert repeat.skip_reason is SignalReason.SAME_DIRECTION_REENTRY
+    engine.note_shadow_cycle(repeat)
+    still_blocked = engine.decide(snap(*window_bull()))
+    assert still_blocked.skip_reason is SignalReason.SAME_DIRECTION_REENTRY
+    other_side = engine.decide(snap(*stronger_bear()))
+    assert other_side.selected_symbol == "TZA"
+    engine.note_shadow_cycle(other_side)
+    repeat_bear = engine.decide(snap(*stronger_bear()))
+    assert repeat_bear.skip_reason is SignalReason.SAME_DIRECTION_REENTRY
+
+
 def test_explicit_no_previous_direction_does_not_apply_cooldown():
     engine = _v3()
     engine.note_shadow_cycle(engine.decide(snap(*window_bull())))
@@ -350,6 +370,24 @@ def _filter_rows():
     ]
 
 
+def test_replay_blocks_a_second_entry_after_an_intervening_skip():
+    run = "shadow-20261008-reentry"
+    rows = [
+        _stored(snap(*window_bull()), run_id=run, cycle=1, iwm_after_pct=0.12, created="2026-10-08T13:45:00"),
+        _stored(snap(*weak_quotes()), run_id=run, cycle=2, iwm_after_pct=0.0, created="2026-10-08T13:47:00"),
+        _stored(snap(*window_bull()), run_id=run, cycle=3, iwm_after_pct=-0.12, created="2026-10-08T13:49:00"),
+    ]
+    report = compare_signal_profiles(rows, ["balanced_v3_shadow"], min_move_pct=0.03)
+    stats = report["profiles"]["balanced_v3_shadow"]
+    assert stats["candidate_count"] == 1
+    assert stats["tna_count"] == 1
+    assert stats["tza_count"] == 0
+    assert stats["same_direction_reentry_count"] == 1
+    assert stats["missed_winners"] == 0
+    assert stats["orders_submitted"] == 0
+    assert report["writes_to_database"] is False
+
+
 def test_replay_reports_before_and_after_confirmation_filters(capsys):
     rows = _filter_rows()
     report = compare_signal_profiles(rows, ["balanced_v3_shadow"], min_move_pct=0.03)
@@ -362,6 +400,7 @@ def test_replay_reports_before_and_after_confirmation_filters(capsys):
     assert stats["direction_sign_failures"] == 0
     assert stats["late_reversal_risk_count"] == 1
     assert stats["direction_flip_cooldown_count"] == 1
+    assert stats["same_direction_reentry_count"] == 0
     assert stats["orders_submitted"] == 0
     assert report["applied_to_live"] is False
 

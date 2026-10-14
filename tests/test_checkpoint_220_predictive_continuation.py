@@ -392,6 +392,8 @@ def test_default_shadow_hard_blocks_elevated_vix_even_with_a_strong_path():
 def test_replay_filters_balanced_candidates_not_only_stored_decisions():
     winner = _stored(strong_accel(), decision="skip", symbol=None, tna_after_pct=0.12, iwm_after_pct=0.12, cycle=1)
     false_signal = _stored(exhausted(), decision="skip", symbol=None, tna_after_pct=-0.12, iwm_after_pct=-0.12, cycle=2)
+    winner["run_id"] = "shadow-220-winner"
+    false_signal["run_id"] = "shadow-220-false"
     report = compare_predictive_continuation(
         [winner, false_signal],
         min_move_pct=0.03,

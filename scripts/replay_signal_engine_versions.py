@@ -238,7 +238,8 @@ def _print_profile_report(report: Dict[str, Any]) -> None:
             print(
                 f"direction_sign_failures: {stats['direction_sign_failures']}  "
                 f"late_reversal_risk_count: {stats['late_reversal_risk_count']}  "
-                f"direction_flip_cooldown_count: {stats['direction_flip_cooldown_count']}"
+                f"direction_flip_cooldown_count: {stats['direction_flip_cooldown_count']}  "
+                f"same_direction_reentry_count: {stats['same_direction_reentry_count']}"
             )
         print("--- examples ---")
         if not stats["examples"]:
