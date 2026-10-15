@@ -22,6 +22,9 @@ Checkpoint 2.20: --predictive-continuation compares stored TNA/TZA candidates
 with the same candidates after the shadow-only continuation filter. It does
 not change engine thresholds or submit orders.
 
+Checkpoint 2.21: --candidate-ranking adds an experimental quality rank on the
+current balanced_v3_shadow candidates. It does not change those decisions.
+
 Exit codes:
   0 comparison printed (also when there are no rows)
   2 configuration / database / unsafe arguments
@@ -46,6 +49,7 @@ from backend.config.tastytrade_urls import SANDBOX_BASE_URL
 from backend.market_data.config import MarketDataConfigError, validate_execution_still_sandbox
 from backend.shadow_mode.analytics import DEFAULT_MIN_FOLLOWUP_MOVE_PCT, load_rows
 from backend.shadow_mode.engine_replay import REPLAY_LABEL, compare_engine_versions
+from backend.shadow_mode.candidate_ranking_replay import compare_candidate_ranking
 from backend.shadow_mode.predictive_replay import compare_predictive_continuation
 from backend.signals.profiles import BALANCED_V3_SHADOW
 from backend.shadow_mode.profile_replay import (
@@ -296,6 +300,106 @@ def _print_predictive(report: Dict[str, Any]) -> None:
     print("analytics_only: true")
 
 
+def _print_tier(label: str, bucket: Dict[str, Any], *, hypothetical: bool) -> None:
+    print(f"{label}:")
+    print(f"  count: {bucket['count']}")
+    if hypothetical:
+        print(f"  hypothetical_correct: {bucket['hypothetical_correct']}")
+        print(f"  hypothetical_incorrect: {bucket['hypothetical_incorrect']}")
+        return
+    print(f"  correct: {bucket['correct']}")
+    print(f"  incorrect: {bucket['incorrect']}")
+    print(f"  accuracy: {_num(bucket['accuracy'])}")
+
+
+def _print_ranking_summary(report: Dict[str, Any], *, heading: str) -> None:
+    print(heading)
+    print(f"candidate_source: {report.get('candidate_source', 'balanced_v3_shadow')}")
+    print(f"candidate_count: {report['candidate_count']}")
+    print(f"tier_a_count: {report['tier_a_count']}")
+    print(f"tier_b_count: {report['tier_b_count']}")
+    print(f"tier_c_count: {report['tier_c_count']}")
+    print(f"rejected_count: {report['rejected_count']}")
+    print(f"accepted_ranked_candidates: {report['accepted_ranked_candidates']}")
+    print(f"rejected_ranked_candidates: {report['rejected_ranked_candidates']}")
+    print(f"correct_before_ranking: {report['correct_before_ranking']}")
+    print(f"incorrect_before_ranking: {report['incorrect_before_ranking']}")
+    print(f"accuracy_before_ranking: {_num(report['accuracy_before_ranking'])}")
+    print(f"correct_after_ranking: {report['correct_after_ranking']}")
+    print(f"incorrect_after_ranking: {report['incorrect_after_ranking']}")
+    print(f"accuracy_after_ranking: {_num(report['accuracy_after_ranking'])}")
+    print(f"false_signals_removed: {report['false_signals_removed']}")
+    print(f"good_signals_removed: {report['good_signals_removed']}")
+    print(f"false_signals_kept: {report['false_signals_kept']}")
+    print(f"good_signals_preserved: {report['good_signals_preserved']}")
+    print(f"missed_winners: {report['missed_winners']}")
+    print("precision_by_tier:")
+    tiers = report["precision_by_tier"]
+    _print_tier("A", tiers["A"], hypothetical=False)
+    _print_tier("B", tiers["B"], hypothetical=False)
+    _print_tier("C", tiers["C"], hypothetical=True)
+    print(f"average_quality_score_correct: {_num(report['average_quality_score_correct'])}")
+    print(f"average_quality_score_incorrect: {_num(report['average_quality_score_incorrect'])}")
+    print(f"quality_separation: {report['quality_separation']}")
+    print(f"candidate_retention_pct: {_num(report['candidate_retention_pct'])}")
+    print("orders_submitted: 0")
+    print("writes_to_database: false")
+    print("analytics_only: true")
+
+
+def _print_rank_example(kind: str, example: Dict[str, Any]) -> None:
+    print(
+        f"  {kind}: run={example.get('run_id')} cycle={example.get('cycle_number')} "
+        f"{example.get('selected_symbol')} tier={example.get('quality_tier')} "
+        f"quality_score={_num(example.get('quality_score'))} "
+        f"momentum_quality={_num(example.get('momentum_quality_score'))} "
+        f"pair_structure={_num(example.get('pair_structure_score'))} "
+        f"market_alignment={_num(example.get('market_alignment_score'))} "
+        f"timing_quality={_num(example.get('timing_quality_score'))} "
+        f"path_consistency={_num(example.get('path_consistency_score'))} "
+        f"continuation_quality={_num(example.get('continuation_quality_score'))} "
+        f"extension_penalty={_num(example.get('extension_penalty'))} "
+        f"disagreement_penalty={_num(example.get('disagreement_penalty'))} "
+        f"correlated_evidence_penalty={_num(example.get('correlated_evidence_penalty'))} "
+        f"independent_confirmation_count={example.get('independent_confirmation_count')} "
+        f"effective_evidence_count={example.get('effective_evidence_count')} "
+        f"continuation_probability={_num(example.get('continuation_probability'))} "
+        f"momentum_phase={example.get('momentum_phase')} "
+        f"actual_followup_correct={example.get('actual_followup_correct')} "
+        f"what_if_result={example.get('what_if_result') or '-'}"
+    )
+
+
+def _print_ranking(report: Dict[str, Any]) -> None:
+    print("=== candidate quality ranking analysis ===")
+    print(f"candidate_source: {report['candidate_source']}")
+    for run in report["per_run"]:
+        _print_ranking_summary(run, heading=f"--- per-run {run['run_id']} ---")
+        examples = run.get("examples") or {}
+        for kind in (
+            "false_signal_correctly_rejected",
+            "winner_incorrectly_rejected",
+            "loser_incorrectly_accepted",
+            "winner_correctly_accepted",
+        ):
+            for example in examples.get(kind) or []:
+                _print_rank_example(kind, example)
+    _print_ranking_summary(report["combined"], heading="--- combined ---")
+    print(f"total_candidates: {report['total_candidates']}")
+    print(f"total_accepted: {report['total_accepted']}")
+    print(f"overall_accuracy_before: {_num(report['overall_accuracy_before'])}")
+    print(f"overall_accuracy_after: {_num(report['overall_accuracy_after'])}")
+    print(f"false_signals_removed: {report['false_signals_removed']}")
+    print(f"good_signals_removed: {report['good_signals_removed']}")
+    print(f"candidate_retention_pct: {_num(report['candidate_retention_pct'])}")
+    print(f"generalization_status: {report['generalization_status']}")
+    print(f"minimum_evaluation_candidates: {report['minimum_evaluation_candidates']}")
+    print(f"sample_size_status: {report['sample_size_status']}")
+    print("orders_submitted: 0")
+    print("writes_to_database: false")
+    print("analytics_only: true")
+
+
 def _parse_session_dates(raw: Optional[str]) -> Optional[List[str]]:
     if not raw or not str(raw).strip():
         return None
@@ -332,6 +436,7 @@ def run_replay(
     signal_profile: Optional[str] = None,
     session_dates: Optional[str] = None,
     predictive_continuation: bool = False,
+    candidate_ranking: bool = False,
 ) -> int:
     try:
         variant_names = parse_variants(variants)
@@ -385,6 +490,9 @@ def run_replay(
         if predictive_continuation
         else None
     )
+    ranking_report = (
+        compare_candidate_ranking(rows, min_move_pct=min_followup_move_pct) if candidate_ranking else None
+    )
     execution = {
         "trading_mode": settings.trading_mode,
         "tastytrade_env": settings.tastytrade_env,
@@ -412,6 +520,8 @@ def run_replay(
         }
         if predictive_report is not None:
             doc["predictive_continuation"] = predictive_report
+        if ranking_report is not None:
+            doc["candidate_ranking"] = ranking_report
         print(json.dumps(doc, indent=2, sort_keys=True, default=str))
         return 0
 
@@ -431,20 +541,33 @@ def run_replay(
         print(f"note: {DIAGNOSTIC_NOTE}")
     if predictive_report is not None:
         _print_predictive(predictive_report)
+    if ranking_report is not None:
+        _print_ranking(ranking_report)
     print(f"note: {REPLAY_LABEL}")
     return 0
 
 
-def _parse_run_ids(raw: Optional[str]) -> Optional[List[str]]:
+def _parse_run_ids(raw: Optional[Any]) -> Optional[List[str]]:
     if not raw:
         return None
-    ids = [part.strip() for part in raw.split(",") if part.strip()]
-    return list(dict.fromkeys(ids)) or None
+    parts = raw if isinstance(raw, (list, tuple)) else [raw]
+    ids: List[str] = []
+    for part in parts:
+        for piece in str(part).split(","):
+            text = piece.strip()
+            if text and text not in ids:
+                ids.append(text)
+    return ids or None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--run-id", default=None, help="one run id or a comma-separated list (combined replay)")
+    parser.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="one run id, repeated, or a comma-separated list (combined replay)",
+    )
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--min-followup-move-pct", type=float, default=DEFAULT_MIN_FOLLOWUP_MOVE_PCT)
@@ -464,6 +587,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="analytics only: filter balanced_v3_shadow candidates when that profile is selected, "
         "otherwise filter stored TNA/TZA decisions",
+    )
+    parser.add_argument(
+        "--candidate-ranking",
+        action="store_true",
+        help="analytics only: experimental quality rank of current balanced_v3_shadow candidates",
     )
     parser.add_argument(
         "--variants",
@@ -488,6 +616,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         signal_profile=args.signal_profile,
         session_dates=args.session_date,
         predictive_continuation=args.predictive_continuation,
+        candidate_ranking=args.candidate_ranking,
     )
 
 
