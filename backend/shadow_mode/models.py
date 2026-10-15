@@ -12,7 +12,7 @@ from backend.signals.predictive_continuation import evaluate_predictive_continua
 
 TRACKED_SYMBOLS = ("TNA", "TZA", "IWM", "SPY", "QQQ")
 FOLLOWUP_MAX_QUOTE_AGE_SECONDS = 5.0
-FOLLOWUP_INDEX_MAX_AGE_SECONDS = 1.0
+FOLLOWUP_INDEX_MAX_AGE_SECONDS = 5.0
 STALE_FOLLOWUP_NOTE = "unscored_due_to_stale_followup"
 SESSION_FIELDS = (
     "session_label",
@@ -89,6 +89,18 @@ def compute_followup_outcome(
     Follow-up quotes older than max_after_age_seconds are not used.
     """
     notes: List[str] = []
+    if after is None or not any(
+        quote is not None and quote.has_quote for quote in (after.get(symbol) for symbol in ("TNA", "TZA", "IWM", "SPY", "QQQ"))
+    ):
+        notes.append(f"{STALE_FOLLOWUP_NOTE}: no market events")
+        return FollowupOutcome(
+            followup_seconds=followup_seconds,
+            mids_after={symbol: None for symbol in TRACKED_SYMBOLS},
+            selected_symbol_move_pct=None,
+            iwm_move_pct=None,
+            direction_was_correct=None,
+            outcome_note="; ".join(notes),
+        )
     mids_after: Dict[str, Optional[float]] = {}
     for symbol in TRACKED_SYMBOLS:
         mid = _mid(after, symbol)
@@ -177,6 +189,9 @@ class ShadowCycleRecord:
     production_execution_blocked: bool = True
     profile_scores: Optional[Dict[str, Any]] = None
     predictive_continuation: Optional[Dict[str, Any]] = None
+    stream_health: Optional[str] = None
+    quiet_symbols: List[str] = field(default_factory=list)
+    hard_stale_symbols: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.assert_safe()
@@ -263,6 +278,9 @@ class ShadowCycleRecord:
             "submitted": self.submitted,
             "production_execution_blocked": self.production_execution_blocked,
             "warnings": list(self.warnings),
+            "stream_health": self.stream_health,
+            "quiet_symbols": list(self.quiet_symbols),
+            "hard_stale_symbols": list(self.hard_stale_symbols),
         }
         if self.profile_scores is not None:
             data["profile_scores"] = dict(self.profile_scores)

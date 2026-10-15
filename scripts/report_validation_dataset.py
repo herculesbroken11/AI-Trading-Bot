@@ -124,6 +124,16 @@ def print_validation_report(report: Mapping[str, Any]) -> None:
     print(f"minimum_labeled_candidates: {report['minimum_labeled_candidates']}")
     print(f"sample_size_status: {report['sample_size_status']}")
     print(f"generalization_status: {report['generalization_status']}")
+    feed = report.get("feed_health") or {}
+    print("feed_health:")
+    print(f"  healthy_cycles: {feed.get('healthy_cycles', 0)}")
+    print(f"  quiet_symbol_cycles: {feed.get('quiet_symbol_cycles', 0)}")
+    print(f"  degraded_cycles: {feed.get('degraded_cycles', 0)}")
+    print(f"  stalled_cycles: {feed.get('stalled_cycles', 0)}")
+    print(f"legacy_freshness_pass_pct: {feed.get('legacy_freshness_pass_pct', 'n/a')}")
+    print(f"soft_fresh_pct: {feed.get('soft_fresh_pct', 'n/a')}")
+    print(f"hard_fresh_pct: {feed.get('hard_fresh_pct', 'n/a')}")
+    print(f"new_liveness_valid_for_evaluation: {str(bool(feed.get('new_liveness_valid_for_evaluation'))).lower()}")
     if report.get("excluded_run_ids"):
         print("excluded_run_ids: " + ",".join(report["excluded_run_ids"]))
     if report["sample_size_status"] == "insufficient":

@@ -81,7 +81,18 @@ def _print_report(report: Dict[str, Any], *, run_id: Optional[str], limit: int) 
             f"skip={example.get('skip_reason') or '-'}"
         )
     print(f"freshness_gate_pass_pct: {_num(report['freshness_gate_pass_pct'])}")
+    print(f"legacy_freshness_pass_pct: {_num(report.get('legacy_freshness_pass_pct', report['freshness_gate_pass_pct']))}")
     print(f"average_quote_age_seconds_overall: {_num(report['average_quote_age_seconds_overall'], '{:.3f}')}")
+    feed = report.get("feed_health") or {}
+    print("feed_health:")
+    print(f"  healthy_cycles: {feed.get('healthy_cycles', 0)}")
+    print(f"  quiet_symbol_cycles: {feed.get('quiet_symbol_cycles', 0)}")
+    print(f"  degraded_cycles: {feed.get('degraded_cycles', 0)}")
+    print(f"  stalled_cycles: {feed.get('stalled_cycles', 0)}")
+    print(f"  hard_stale_cycles: {feed.get('hard_stale_cycles', 0)}")
+    print(f"soft_fresh_pct: {_num(feed.get('soft_fresh_pct'))}")
+    print(f"hard_fresh_pct: {_num(feed.get('hard_fresh_pct'))}")
+    print(f"new_liveness_valid_for_evaluation: {str(bool(feed.get('new_liveness_valid_for_evaluation'))).lower()}")
     print(f"valid_for_signal_evaluation: {str(report['valid_for_signal_evaluation']).lower()}")
     if report["evaluation_block_reasons"]:
         print("evaluation_block_reasons: " + "; ".join(report["evaluation_block_reasons"]))

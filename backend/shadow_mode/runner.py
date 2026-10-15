@@ -44,6 +44,8 @@ from backend.shadow_mode.stream_readiness import (
     STALE_FEED_SECONDS,
     WARMUP_FRESH_SECONDS,
     WARMUP_TIMEOUT_SECONDS,
+    StreamHealth,
+    assess_stream_health,
     is_stale_feed,
     quotes_are_fresh,
 )
@@ -248,6 +250,7 @@ class ShadowModeRunner:
                 decision=result.decision,
                 snapshot=result.snapshot,
             )
+            self._attach_health(record, self._snapshot_health(result.snapshot))
             if session is not None:
                 record.apply_session(session.record_fields())
             self._logger.log(record)
@@ -327,25 +330,33 @@ class ShadowModeRunner:
         return False
 
     def _preflight(self, summary: ShadowRunSummary, cycle: int) -> bool:
-        """One refresh when quotes are stale. Still stale -> stream_not_ready, no signal score."""
+        """Refresh only when the feed is stalled or a required symbol is hard stale.
+
+        A quiet symbol on a live socket does not reconnect and does not block.
+        """
         client = None
         try:
             client = self._open_client()
             client.stream(1.0, max_age_seconds=self._run.quote_fresh_seconds)
-            ages = self._ages(client)
-            if not quotes_are_fresh(ages, max_age_seconds=self._run.quote_fresh_seconds):
-                if is_stale_feed(ages, stale_seconds=self._run.stale_feed_seconds):
-                    self._on_event("stream_reconnect_due_to_stale_feed", {"cycle": cycle})
+            health = assess_stream_health(self._ages(client))
+            self._emit_health(cycle, health)
+            if health.cycle_blocked:
+                if health.feed_reconnect_reason:
+                    self._on_event(
+                        "stream_reconnect_due_to_stale_feed",
+                        {"cycle": cycle, "feed_reconnect_reason": health.feed_reconnect_reason},
+                    )
                 client.disconnect()
                 client = self._open_client()
                 deadline = client.now() + self._run.preflight_wait_seconds
                 while client.now() < deadline:
                     client.stream(0.5, max_age_seconds=self._run.quote_fresh_seconds)
-                    ages = self._ages(client)
-                    if quotes_are_fresh(ages, max_age_seconds=self._run.quote_fresh_seconds):
+                    health = assess_stream_health(self._ages(client))
+                    if not health.cycle_blocked:
+                        self._emit_health(cycle, health)
                         return True
                 snapshot = MarketSnapshot.from_stream_state(client.state, now=client.now())
-                self._log_stream_not_ready(summary, cycle, snapshot, "quotes stayed stale after one resubscribe")
+                self._log_stream_not_ready(summary, cycle, snapshot, health.feed_reconnect_reason or "required symbol hard stale")
                 return False
             return True
         except MarketDataError as exc:
@@ -373,8 +384,13 @@ class ShadowModeRunner:
             provider=self._provider_or_default(),
             stream_factory=self._stream_factory,
         )
-        if is_stale_feed(self._snapshot_ages(snapshot), stale_seconds=self._run.stale_feed_seconds):
-            self._on_event("stream_reconnect_due_to_stale_feed", {"cycle": "signal"})
+        health = self._snapshot_health(snapshot)
+        self._emit_health(cycle, health)
+        if health.feed_reconnect_reason or is_stale_feed(self._snapshot_ages(snapshot), stale_seconds=self._run.stale_feed_seconds):
+            self._on_event(
+                "stream_reconnect_due_to_stale_feed",
+                {"cycle": "signal", "feed_reconnect_reason": health.feed_reconnect_reason or "stale_feed"},
+            )
             snapshot, _summary, token_summary = collect_snapshot_from_dxlink(
                 self._config,
                 symbols=symbols,
@@ -383,8 +399,10 @@ class ShadowModeRunner:
                 provider=self._provider_or_default(),
                 stream_factory=self._stream_factory,
             )
-        if not quotes_are_fresh(self._snapshot_ages(snapshot), max_age_seconds=self._run.quote_fresh_seconds):
-            self._log_stream_not_ready(summary, cycle, snapshot, "signal window ended without fresh quotes")
+            health = self._snapshot_health(snapshot)
+            self._emit_health(cycle, health)
+        if health.cycle_blocked:
+            self._log_stream_not_ready(summary, cycle, snapshot, health.feed_reconnect_reason or "required symbol hard stale")
             return None
         return DXLinkSignalResult(
             decision=self._engine.decide(snapshot),
@@ -393,8 +411,20 @@ class ShadowModeRunner:
             token_summary=token_summary,
         )
 
+    def _snapshot_health(self, snapshot: Optional[MarketSnapshot]) -> StreamHealth:
+        return assess_stream_health({} if snapshot is None else self._snapshot_ages(snapshot))
+
+    def _emit_health(self, cycle: int, health: StreamHealth) -> None:
+        self._on_event("stream_health", {"cycle": cycle, **health.to_dict()})
+
+    def _attach_health(self, record: ShadowCycleRecord, health: StreamHealth) -> None:
+        record.stream_health = health.state.value
+        record.quiet_symbols = list(health.quiet_symbols)
+        record.hard_stale_symbols = list(health.hard_stale_symbols)
+
     def _log_stream_not_ready(self, summary: ShadowRunSummary, cycle: int, snapshot: Optional[MarketSnapshot], detail: str) -> None:
         record = self._not_ready_record(cycle, snapshot, detail)
+        self._attach_health(record, self._snapshot_health(snapshot))
         self._logger.log(record)
         summary.records.append(record)
         self._on_event("decision", {"record": record, "decision": None})

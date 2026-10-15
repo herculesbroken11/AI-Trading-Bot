@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from backend.shadow_mode.analytics import followup_move, pct_move
 from backend.shadow_mode.profile_replay import _ordered_rows, _remember_direction, replay_profile_row
 from backend.shadow_mode.session_quality import BAD_SESSION_LABELS, effective_session_label, group_stats, window_quality
+from backend.shadow_mode.stream_readiness import summarize_liveness
 from backend.signals.candidate_quality_ranker import rank_candidate
 from backend.signals.models import MarketSnapshot, SymbolQuote
 from backend.signals.predictive_continuation import continuation_entry_block, evaluate_predictive_continuation
@@ -526,6 +527,10 @@ def build_validation_dataset(
         dates = sorted({str(meta["session_date"]) for meta in run_meta.values() if meta.get("session_date")})
     tna = sum(1 for record in records if record["symbol"] == "TNA")
     tza = sum(1 for record in records if record["symbol"] == "TZA")
+    liveness = summarize_liveness(unique)
+    known_fresh = [row.get("freshness_gate_passed") for row in unique if row.get("freshness_gate_passed") is not None]
+    legacy_pct = None if not known_fresh else round(sum(1 for flag in known_fresh if flag) / len(known_fresh) * 100.0, 1)
+    liveness["legacy_freshness_pass_pct"] = legacy_pct
     return {
         "runs": len(by_run),
         "run_ids": sorted(by_run),
@@ -537,6 +542,7 @@ def build_validation_dataset(
         "labeled_candidates_120s": labeled[120],
         "labeled_candidates": labeled_any,
         "tna_candidates": tna,
+        "feed_health": liveness,
         "tza_candidates": tza,
         "baseline_accuracy": {f"{horizon}s": _accuracy(record.get(f"direction_correct_{horizon}s") for record in records) for horizon in HORIZONS},
         "accuracy_by": {

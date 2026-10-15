@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from backend.shadow_mode.models import SESSION_FIELDS, STALE_FOLLOWUP_NOTE, TRACKED_SYMBOLS
 from backend.shadow_mode.session_quality import overall_market_window_quality, session_breakdown
+from backend.shadow_mode.stream_readiness import summarize_liveness
 
 DATA_QUALITY_SKIPS = frozenset({"stale_market_data", "missing_required_quote"})
 UNCLEAR_SKIPS = frozenset({"unclear_market_direction"})
@@ -279,7 +280,9 @@ def summarize_shadow_logs(rows: Iterable[Any], *, latest: int = 10, min_followup
             for d in blocked[:5]
         ],
         "freshness_gate_pass_pct": freshness_pct,
+        "legacy_freshness_pass_pct": freshness_pct,
         "average_quote_age_seconds_overall": average_age,
+        "feed_health": summarize_liveness(items),
         "strict_direction_outcome": strict,
         "meaningful_move_outcome": meaningful,
         **evaluation,

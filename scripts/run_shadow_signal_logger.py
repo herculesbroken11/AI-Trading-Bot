@@ -409,6 +409,16 @@ def run_shadow(
             out.line(f"warmup_failed_reason: {payload['reason']}")
         elif kind == "stream_reconnect_due_to_stale_feed":
             out.line("stream_reconnect_due_to_stale_feed")
+        elif kind == "stream_health":
+            quiet = payload.get("quiet_symbols") or []
+            hard = payload.get("hard_stale_symbols") or []
+            out.line(f"stream_health: {payload.get('stream_health')}")
+            out.line(f"required_symbols_ready: {str(not payload.get('cycle_blocked')).lower()}")
+            out.line("quiet_symbols: " + (", ".join(quiet) if quiet else "none"))
+            out.line("hard_stale_symbols: " + (", ".join(hard) if hard else "none"))
+            out.line(f"feed_event_age: {_num(payload.get('feed_event_age'), '{:.3f}')}")
+            if payload.get("feed_reconnect_reason"):
+                out.line(f"feed_reconnect_reason: {payload['feed_reconnect_reason']}")
         elif kind == "cycle_start":
             out.line(f"--- cycle {payload['cycle']}/{payload['cycles']} ---")
         elif kind == "session":
@@ -474,6 +484,15 @@ def run_shadow(
         sessions[record.session_label or "unknown"] = sessions.get(record.session_label or "unknown", 0) + 1
     out.document["summary"]["session_labels"] = sessions
     out.line("session_labels: " + (", ".join(f"{k}={v}" for k, v in sorted(sessions.items())) or "none"))
+    health_counts: Dict[str, int] = {}
+    for record in summary.records:
+        if record.stream_health:
+            health_counts[record.stream_health] = health_counts.get(record.stream_health, 0) + 1
+    out.line(f"quiet_symbol_cycle_count: {health_counts.get('QUIET_SYMBOL', 0)}")
+    out.line(f"degraded_feed_cycle_count: {health_counts.get('DEGRADED', 0)}")
+    out.line(f"stalled_feed_cycle_count: {health_counts.get('STALLED', 0)}")
+    out.line(f"hard_stale_cycle_count: {sum(1 for record in summary.records if record.hard_stale_symbols)}")
+    out.line(f"stream_not_ready_count: {sum(1 for record in summary.records if record.skip_reason == 'stream_not_ready')}")
     if summary.session_blocked:
         out.line(f"warning: run stopped early by market session guard: {summary.session_block_reason}")
     for warning in signal_logger.warnings:

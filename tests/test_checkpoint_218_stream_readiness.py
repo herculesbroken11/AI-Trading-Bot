@@ -145,7 +145,7 @@ def test_stale_followup_is_not_scored():
     after = MarketSnapshot(
         quotes={
             "TNA": SymbolQuote("TNA", bid=45.49, ask=45.51, quote_age_seconds=0.2, quote_updates=2),
-            "IWM": SymbolQuote("IWM", bid=220.49, ask=220.51, quote_age_seconds=2.5, quote_updates=2),
+            "IWM": SymbolQuote("IWM", bid=220.49, ask=220.51, quote_age_seconds=6.0, quote_updates=2),
             "SPY": SymbolQuote("SPY", bid=580.49, ask=580.51, quote_age_seconds=0.2, quote_updates=2),
             "QQQ": SymbolQuote("QQQ", bid=500.49, ask=500.51, quote_age_seconds=0.2, quote_updates=2),
         }
