@@ -16,7 +16,7 @@ analytics_only: true
 from __future__ import annotations
 
 import json
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,10 @@ MINIMUM_LABELED_CANDIDATES = 20
 PRELIMINARY_LABELED_CANDIDATES = 50
 HORIZONS = (30, 60, 120)
 _NY = ZoneInfo("America/New_York")
+# ShadowSignalRepository.log_signal stores decision.created_at.replace(tzinfo=None).
+# The engine and the not-ready path set that value with datetime.now(timezone.utc).
+# The column is DateTime without a timezone, so the database value is UTC-naive.
+STORED_TIMESTAMP_SEMANTICS = "UTC-naive"
 _OPEN = time(9, 30)
 _CLOSE = time(16, 0)
 TRADE_DECISIONS = frozenset({"bullish", "bearish"})
@@ -67,8 +71,13 @@ def _snapshot(row: Mapping[str, Any]) -> Optional[MarketSnapshot]:
         return None
 
 
-def _parse_created(value: Any) -> Optional[datetime]:
-    if value is None:
+def parse_observation_timestamp(value: Any) -> Optional[datetime]:
+    """UTC instant for one stored observation. Naive values use the logger convention.
+
+    The calendar date is not read from the run id. .date() is only called after
+    conversion to America/New_York.
+    """
+    if value is None or value == "":
         return None
     if isinstance(value, datetime):
         created = value
@@ -77,16 +86,101 @@ def _parse_created(value: Any) -> Optional[datetime]:
             created = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except ValueError:
             return None
-    return created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created.astimezone(timezone.utc)
 
 
-def _session_date(row: Mapping[str, Any], created: Optional[datetime]) -> Optional[str]:
-    explicit = row.get("session_date")
-    if explicit:
-        return str(explicit)[:10]
-    if created is None:
+def timestamp_semantics(value: Any) -> str:
+    """Label the value that was stored, not a date guessed from the run id."""
+    if value is None or value == "":
+        return "missing"
+    if isinstance(value, datetime):
+        created = value
+    else:
+        text = str(value).strip()
+        if text.endswith("Z") or text.endswith("+00:00"):
+            return "UTC-aware"
+        try:
+            created = datetime.fromisoformat(text)
+        except ValueError:
+            return "unparsed"
+        if created.tzinfo is None:
+            return STORED_TIMESTAMP_SEMANTICS
+    if created.tzinfo is None or created.utcoffset() is None:
+        return STORED_TIMESTAMP_SEMANTICS
+    offset = created.utcoffset()
+    if offset == timedelta(0):
+        return "UTC-aware"
+    eastern_offset = created.astimezone(_NY).utcoffset()
+    if offset == eastern_offset:
+        return "ET-aware"
+    sign = "+" if offset >= timedelta(0) else "-"
+    total = abs(int(offset.total_seconds()))
+    return f"aware{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
+
+
+def to_eastern(value: Any) -> Optional[datetime]:
+    instant = parse_observation_timestamp(value)
+    if instant is None:
         return None
-    return created.astimezone(_NY).date().isoformat()
+    return instant.astimezone(_NY)
+
+
+def et_session_date(value: Any) -> Optional[str]:
+    local = to_eastern(value)
+    if local is None:
+        return None
+    return local.date().isoformat()
+
+
+def _raw_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def diagnose_run(run_id: str, rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """First and last observation of one run, converted only after the UTC instant is known."""
+    parsed: List[Tuple[datetime, Any, str]] = []
+    for row in rows:
+        raw = row.get("created_at")
+        instant = parse_observation_timestamp(raw)
+        if instant is None:
+            continue
+        parsed.append((instant, raw, timestamp_semantics(raw)))
+    parsed.sort(key=lambda item: item[0])
+    if not parsed:
+        return {
+            "run_id": run_id,
+            "first_raw_timestamp": None,
+            "last_raw_timestamp": None,
+            "timestamp_semantics": "missing",
+            "first_et": None,
+            "last_et": None,
+            "derived_dates": [],
+        }
+    labels = sorted({item[2] for item in parsed})
+    dates: List[str] = []
+    for instant, _raw, _label in parsed:
+        day = instant.astimezone(_NY).date().isoformat()
+        if day not in dates:
+            dates.append(day)
+    return {
+        "run_id": run_id,
+        "first_raw_timestamp": _raw_timestamp(parsed[0][1]),
+        "last_raw_timestamp": _raw_timestamp(parsed[-1][1]),
+        "timestamp_semantics": labels[0] if len(labels) == 1 else "mixed: " + ", ".join(labels),
+        "first_et": parsed[0][0].astimezone(_NY).isoformat(),
+        "last_et": parsed[-1][0].astimezone(_NY).isoformat(),
+        "derived_dates": sorted(dates),
+    }
+
+
+def _parse_created(value: Any) -> Optional[datetime]:
+    return parse_observation_timestamp(value)
 
 
 def _clock(row: Mapping[str, Any], created: Optional[datetime]) -> Tuple[Optional[bool], Optional[float], Optional[float], str]:
@@ -412,9 +506,8 @@ def build_validation_dataset(
             for row in group
             for symbol in ("TNA", "TZA", "IWM", "SPY", "QQQ", "VIX")
         ]
-        created = _parse_created(group[0].get("created_at"))
         run_meta[run_id] = {
-            "session_date": _session_date(group[0], created),
+            "session_date": et_session_date(group[0].get("created_at")),
             "freshness_pass_pct": stats["freshness_pass_pct"] if has_freshness else None,
             "average_quote_age": _avg(ages),
             "market_window_quality": quality,
@@ -468,7 +561,7 @@ def build_validation_dataset(
         horizons = _horizon_moves(row, str(symbol))
         record: Dict[str, Any] = {
             "run_id": run_id,
-            "session_date": _session_date(row, created) or meta.get("session_date"),
+            "session_date": et_session_date(created),
             "cycle": row.get("cycle_number"),
             "timestamp": created.isoformat() if created else row.get("created_at"),
             "symbol": symbol,
@@ -524,9 +617,8 @@ def build_validation_dataset(
 
     labeled = {horizon: sum(1 for record in records if record.get(f"direction_correct_{horizon}s") is not None) for horizon in HORIZONS}
     labeled_any = sum(1 for record in records if _primary_correct(record) is not None)
-    dates = sorted({str(record["session_date"]) for record in records if record.get("session_date")})
-    if not dates:
-        dates = sorted({str(meta["session_date"]) for meta in run_meta.values() if meta.get("session_date")})
+    diagnostics = [diagnose_run(run_id, group) for run_id, group in sorted(by_run.items())]
+    dates = sorted({day for item in diagnostics for day in item["derived_dates"]})
     tna = sum(1 for record in records if record["symbol"] == "TNA")
     tza = sum(1 for record in records if record["symbol"] == "TZA")
     liveness = summarize_liveness(unique)
@@ -537,6 +629,7 @@ def build_validation_dataset(
         "runs": len(by_run),
         "run_ids": sorted(by_run),
         "session_dates": dates,
+        "session_date_diagnostics": diagnostics,
         "total_cycles": len(included),
         "total_candidates": len(records),
         "labeled_candidates_30s": labeled[30],

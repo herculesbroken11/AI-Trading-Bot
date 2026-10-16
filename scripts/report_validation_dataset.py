@@ -99,6 +99,16 @@ def print_validation_report(report: Mapping[str, Any]) -> None:
     print("=== validation dataset summary ===")
     print(f"runs: {report['runs']}")
     print(f"session_dates: {', '.join(report['session_dates']) if report['session_dates'] else 'n/a'}")
+    for item in report.get("session_date_diagnostics") or []:
+        derived = ", ".join(item.get("derived_dates") or []) or "n/a"
+        print("session_date_diagnostics:")
+        print(f"  run_id: {item.get('run_id')}")
+        print(f"  first_raw_timestamp: {item.get('first_raw_timestamp')}")
+        print(f"  last_raw_timestamp: {item.get('last_raw_timestamp')}")
+        print(f"  timestamp_semantics: {item.get('timestamp_semantics')}")
+        print(f"  first_et: {item.get('first_et')}")
+        print(f"  last_et: {item.get('last_et')}")
+        print(f"  derived_dates: {derived}")
     print(f"total_cycles: {report['total_cycles']}")
     print(f"total_candidates: {report['total_candidates']}")
     print(f"labeled_candidates_30s: {report['labeled_candidates_30s']}")
