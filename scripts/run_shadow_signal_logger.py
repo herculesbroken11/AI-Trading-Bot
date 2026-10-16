@@ -60,6 +60,7 @@ from backend.shadow_mode.runner import (
     production_execution_block_checks,
     validate_shadow_environment,
 )
+from backend.shadow_mode.semiconductor_context import shadow_stream_symbols
 from backend.signals.dxlink_signal_source import DEFAULT_SIGNAL_SYMBOLS, StreamFactory
 from backend.signals.models import SIGNAL_ENGINE_VERSION
 from backend.signals.predictive_continuation import PredictiveContinuationResult, format_shadow_lines
@@ -112,6 +113,17 @@ def _num(value: Optional[float], fmt: str = "{:g}") -> str:
     return "n/a" if value is None else fmt.format(value)
 
 
+def _print_semiconductor(out: _Output, context: Optional[dict]) -> None:
+    payload = context or {}
+    agreement = payload.get("semiconductor_agreement")
+    out.line("semiconductor_context:")
+    out.line(f"  SOXL move: {_num(payload.get('soxl_window_move_pct'), '{:+.4f}%')}")
+    out.line(f"  SOXS move: {_num(payload.get('soxs_window_move_pct'), '{:+.4f}%')}")
+    out.line(f"  pair_spread: {_num(payload.get('semiconductor_pair_spread_pct'), '{:+.4f}')}")
+    out.line(f"  direction: {payload.get('semiconductor_direction') or 'UNAVAILABLE'}")
+    out.line(f"  agreement_with_candidate: {agreement if agreement else 'n/a'}")
+
+
 def _print_record(out: _Output, record: ShadowCycleRecord) -> None:
     label = record.selected_symbol or "SKIP"
     out.line(
@@ -137,6 +149,7 @@ def _print_record(out: _Output, record: ShadowCycleRecord) -> None:
             f"chop_risk={_num(quality.get('chop_risk_score'))} pullback_risk={_num(quality.get('pullback_risk_score'))}"
         )
     out.line(f"explanation: {record.explanation}")
+    _print_semiconductor(out, record.semiconductor_context)
     scores = record.profile_scores
     if scores:
         out.line(
@@ -562,7 +575,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ConfigurationError as exc:
         return _fail(_Output(args.json), "load_settings", str(exc), exit_code=CONFIG_EXIT_CODE)
 
-    symbols: List[str] = list(DEFAULT_SIGNAL_SYMBOLS)
+    symbols = shadow_stream_symbols(DEFAULT_SIGNAL_SYMBOLS)
     if args.no_vix:
         symbols = [s for s in symbols if s != "VIX"]
     return run_shadow(

@@ -38,6 +38,7 @@ from backend.shadow_mode.models import (
     ShadowRunSummary,
     compute_followup_outcome,
 )
+from backend.shadow_mode.semiconductor_context import evaluate_semiconductor_context
 from backend.shadow_mode.stream_readiness import (
     PREFLIGHT_WAIT_SECONDS,
     QUOTE_FRESH_SECONDS,
@@ -437,7 +438,7 @@ class ShadowModeRunner:
                 quote = snapshot.get(symbol)
                 ages[symbol] = None if quote is None else quote.quote_age_seconds
                 mids[symbol] = None if quote is None else quote.mid
-        return ShadowCycleRecord(
+        record = ShadowCycleRecord(
             run_id=self.run_id,
             cycle_number=cycle,
             created_at=datetime.now(timezone.utc),
@@ -456,6 +457,10 @@ class ShadowModeRunner:
             raw_snapshot_json=json.dumps(snapshot.to_dict()) if snapshot is not None else "{}",
             raw_score_json="{}",
         )
+        context = evaluate_semiconductor_context(snapshot, decision="skip", selected_symbol=None)
+        record.semiconductor_context = context
+        record.raw_score_json = json.dumps({"semiconductor_context": context}, sort_keys=True)
+        return record
 
     def _check_session(self, summary: ShadowRunSummary, cycle: int) -> Optional[SessionGuardDecision]:
         if self._session_guard is None:

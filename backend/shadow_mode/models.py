@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from backend.shadow_mode.semiconductor_context import evaluate_semiconductor_context
 from backend.signals.models import MarketSnapshot, SignalDecision, SignalDirection
 from backend.signals.predictive_continuation import evaluate_predictive_continuation
 
@@ -192,6 +193,7 @@ class ShadowCycleRecord:
     stream_health: Optional[str] = None
     quiet_symbols: List[str] = field(default_factory=list)
     hard_stale_symbols: List[str] = field(default_factory=list)
+    semiconductor_context: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.assert_safe()
@@ -225,6 +227,12 @@ class ShadowCycleRecord:
         predictive = _predictive_payload(decision, snapshot)
         if predictive is not None:
             score_payload["predictive_continuation"] = predictive
+        semiconductor = evaluate_semiconductor_context(
+            snapshot,
+            decision=decision.decision.value,
+            selected_symbol=decision.selected_symbol,
+        )
+        score_payload["semiconductor_context"] = semiconductor
         return cls(
             run_id=run_id,
             cycle_number=cycle_number,
@@ -246,6 +254,7 @@ class ShadowCycleRecord:
             warnings=list(decision.warnings),
             profile_scores=profile_scores,
             predictive_continuation=predictive,
+            semiconductor_context=semiconductor,
         )
 
     def apply_followup(self, outcome: FollowupOutcome) -> None:
@@ -281,6 +290,7 @@ class ShadowCycleRecord:
             "stream_health": self.stream_health,
             "quiet_symbols": list(self.quiet_symbols),
             "hard_stale_symbols": list(self.hard_stale_symbols),
+            "semiconductor_context": None if self.semiconductor_context is None else dict(self.semiconductor_context),
         }
         if self.profile_scores is not None:
             data["profile_scores"] = dict(self.profile_scores)

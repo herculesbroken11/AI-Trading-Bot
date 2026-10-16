@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from backend.shadow_mode.models import SESSION_FIELDS, STALE_FOLLOWUP_NOTE, TRACKED_SYMBOLS
 from backend.shadow_mode.session_quality import overall_market_window_quality, session_breakdown
+from backend.shadow_mode.semiconductor_context import context_from_row, summarize_semiconductor
 from backend.shadow_mode.stream_readiness import summarize_liveness
 
 DATA_QUALITY_SKIPS = frozenset({"stale_market_data", "missing_required_quote"})
@@ -191,7 +192,11 @@ def _evaluation(items: List[Dict[str, Any]], *, freshness_pct: Optional[float], 
 
 
 def summarize_shadow_logs(rows: Iterable[Any], *, latest: int = 10, min_followup_move_pct: float = DEFAULT_MIN_FOLLOWUP_MOVE_PCT) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = [row_to_dict(r) for r in rows]
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        item = row_to_dict(row)
+        item["semiconductor_context"] = context_from_row(row)
+        items.append(item)
     items.sort(key=lambda d: (d.get("created_at") or "", d.get("id") or 0), reverse=True)
 
     by_decision = {k: [d for d in items if d.get("decision") == k] for k in ("bullish", "bearish", "skip")}
@@ -283,6 +288,13 @@ def summarize_shadow_logs(rows: Iterable[Any], *, latest: int = 10, min_followup
         "legacy_freshness_pass_pct": freshness_pct,
         "average_quote_age_seconds_overall": average_age,
         "feed_health": summarize_liveness(items),
+        "semiconductor_context": summarize_semiconductor(
+            [
+                {**item, "direction_correct_60s": item.get("direction_was_correct")}
+                for item in items
+                if item.get("decision") in ("bullish", "bearish")
+            ]
+        ),
         "strict_direction_outcome": strict,
         "meaningful_move_outcome": meaningful,
         **evaluation,

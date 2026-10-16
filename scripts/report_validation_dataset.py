@@ -28,6 +28,7 @@ from backend.config.settings import ConfigurationError, Settings, load_settings,
 from backend.market_data.config import MarketDataConfigError, validate_execution_still_sandbox
 from backend.shadow_mode.analytics import DEFAULT_MIN_FOLLOWUP_MOVE_PCT, load_rows
 from backend.shadow_mode.runner import production_execution_block_checks
+from backend.shadow_mode.semiconductor_context import semiconductor_report_lines
 from backend.shadow_mode.validation_dataset import build_validation_dataset
 
 CONFIG_EXIT_CODE = 2
@@ -134,6 +135,8 @@ def print_validation_report(report: Mapping[str, Any]) -> None:
     print(f"soft_fresh_pct: {feed.get('soft_fresh_pct', 'n/a')}")
     print(f"hard_fresh_pct: {feed.get('hard_fresh_pct', 'n/a')}")
     print(f"new_liveness_valid_for_evaluation: {str(bool(feed.get('new_liveness_valid_for_evaluation'))).lower()}")
+    for line in semiconductor_report_lines(report.get("semiconductor_context")):
+        print(line)
     if report.get("excluded_run_ids"):
         print("excluded_run_ids: " + ",".join(report["excluded_run_ids"]))
     if report["sample_size_status"] == "insufficient":

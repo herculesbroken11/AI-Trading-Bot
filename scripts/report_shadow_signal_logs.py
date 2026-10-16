@@ -28,6 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from backend.config.settings import ConfigurationError, Settings, load_settings, reset_settings_cache
 from backend.shadow_mode.models import TRACKED_SYMBOLS
+from backend.shadow_mode.semiconductor_context import semiconductor_report_lines
 from backend.shadow_mode.report import row_to_dict, summarize_shadow_logs
 from backend.shadow_mode.session_quality import split_bad_session_windows
 
@@ -125,6 +126,8 @@ def _print_report(report: Dict[str, Any], *, run_id: Optional[str], limit: int) 
             f"avg_iwm_move_pct={_num(stats['avg_iwm_move_pct'], '{:+.4f}')}"
         )
     print(f"skip_avg_iwm_move_pct: {_num(outcomes['skip_avg_iwm_move_pct'], '{:+.4f}')}")
+    for line in semiconductor_report_lines(report.get("semiconductor_context")):
+        print(line)
     print("--- session breakdown ---")
     for label, s in report["session_breakdown"].items():
         print(
