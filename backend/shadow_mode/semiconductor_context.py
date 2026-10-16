@@ -117,6 +117,80 @@ def _lookup(row: Any, name: str) -> Any:
     return getattr(row, name, None)
 
 
+def _eligible(decision: Optional[str], symbol: Optional[str]) -> bool:
+    return decision in ("bullish", "bearish") and symbol in ("TNA", "TZA")
+
+
+def _quote_was_stored(quote: Any) -> bool:
+    if not isinstance(quote, dict):
+        return False
+    if quote.get("quote_updates") or quote.get("quote_age_seconds") is not None:
+        return True
+    return quote.get("bid") is not None and quote.get("ask") is not None
+
+
+def row_has_semiconductor_fields(row: Any) -> bool:
+    """True only when this row already stored a SOXL or SOXS quote or move."""
+    blobs = [
+        _lookup(row, "semiconductor_context"),
+        _loads(_lookup(row, "raw_score_json")).get("semiconductor_context"),
+    ]
+    for blob in blobs:
+        if not isinstance(blob, dict):
+            continue
+        if blob.get("soxl_window_move_pct") is not None or blob.get("soxs_window_move_pct") is not None:
+            return True
+        if blob.get("fields_present") is True:
+            return True
+        direction = blob.get("semiconductor_direction")
+        if direction not in (None, DIRECTION_UNAVAILABLE):
+            return True
+    quotes = _loads(_lookup(row, "raw_snapshot_json")).get("quotes") or {}
+    if not isinstance(quotes, dict):
+        return False
+    for name in CONTEXT_SYMBOLS:
+        if _quote_was_stored(quotes.get(name) or quotes.get(name.lower())):
+            return True
+    return False
+
+
+def context_for_candidate(row: Any, *, decision: Optional[str], symbol: Optional[str]) -> Dict[str, Any]:
+    """Context for one replayed candidate. Missing history stays UNAVAILABLE.
+
+    Agreement uses the candidate's direction and symbol. A stored skip decision
+    cannot leave the agreement null.
+    """
+    present = row_has_semiconductor_fields(row)
+    snapshot = None
+    payload = _loads(_lookup(row, "raw_snapshot_json"))
+    if payload.get("quotes"):
+        try:
+            snapshot = MarketSnapshot.from_dict(payload)
+        except (KeyError, TypeError, ValueError):
+            snapshot = None
+    context = evaluate_semiconductor_context(snapshot, decision=decision, selected_symbol=symbol)
+    context["fields_present"] = present
+    if not present:
+        context["soxl_window_move_pct"] = None
+        context["soxs_window_move_pct"] = None
+        context["semiconductor_pair_spread_pct"] = None
+        context["semiconductor_direction"] = DIRECTION_UNAVAILABLE
+        if _eligible(decision, symbol):
+            context["semiconductor_agreement"] = DIRECTION_UNAVAILABLE
+            context["bucket_reason"] = "no stored SOXL/SOXS data"
+        else:
+            context["semiconductor_agreement"] = None
+            context["exclusion_reason"] = "not a bullish TNA or bearish TZA candidate"
+            context["bucket_reason"] = context["exclusion_reason"]
+        return context
+    context["bucket_reason"] = "classified from stored semiconductor quotes"
+    if context.get("semiconductor_agreement") not in AGREEMENT_VALUES and _eligible(decision, symbol):
+        context["semiconductor_agreement"] = _agreement(
+            decision, symbol, str(context.get("semiconductor_direction") or DIRECTION_UNAVAILABLE)
+        )
+    return context
+
+
 def context_from_row(row: Any) -> Dict[str, Any]:
     """Read stored context, else the stored snapshot. Old rows stay unavailable.
 
@@ -128,17 +202,10 @@ def context_from_row(row: Any) -> Dict[str, Any]:
     stored = _loads(_lookup(row, "raw_score_json")).get("semiconductor_context")
     if isinstance(stored, dict) and stored.get("semiconductor_direction"):
         return dict(stored)
-    snapshot = None
-    payload = _loads(_lookup(row, "raw_snapshot_json"))
-    if payload.get("quotes"):
-        try:
-            snapshot = MarketSnapshot.from_dict(payload)
-        except (KeyError, TypeError, ValueError):
-            snapshot = None
-    return evaluate_semiconductor_context(
-        snapshot,
-        decision=_lookup(row, "decision"),
-        selected_symbol=_lookup(row, "selected_symbol"),
+    return context_for_candidate(
+        row,
+        decision=_lookup(row, "direction") or _lookup(row, "decision"),
+        symbol=_lookup(row, "symbol") or _lookup(row, "selected_symbol"),
     )
 
 
@@ -153,6 +220,74 @@ def _sign(value: Optional[float]) -> int:
     return 1 if value > 0 else -1
 
 
+def _candidate_identity(record: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "run_id": record.get("run_id"),
+        "session_date": record.get("session_date"),
+        "cycle": record.get("cycle", record.get("cycle_number")),
+        "symbol": record.get("symbol") or record.get("selected_symbol"),
+        "direction": record.get("direction") or record.get("decision"),
+    }
+
+
+def _resolve_context(record: Mapping[str, Any]) -> Dict[str, Any]:
+    """One bucket per labeled candidate. Null agreement is not dropped."""
+    context = record.get("semiconductor_context")
+    if not isinstance(context, dict):
+        context = context_from_row(record)
+    context = dict(context)
+    identity = _candidate_identity(record)
+    decision = identity["direction"]
+    symbol = identity["symbol"]
+    stored_agreement = context.get("semiconductor_agreement")
+    present = context.get("fields_present")
+    if present is None:
+        present = (
+            context.get("soxl_window_move_pct") is not None
+            or context.get("soxs_window_move_pct") is not None
+            or context.get("semiconductor_direction") not in (None, DIRECTION_UNAVAILABLE)
+        )
+    context["fields_present"] = bool(present)
+    if not present:
+        context["semiconductor_direction"] = DIRECTION_UNAVAILABLE
+        context["soxl_window_move_pct"] = None
+        context["soxs_window_move_pct"] = None
+        context["semiconductor_pair_spread_pct"] = None
+        if _eligible(decision, symbol):
+            context["semiconductor_agreement"] = DIRECTION_UNAVAILABLE
+            if stored_agreement is None:
+                context["bucket_reason"] = (
+                    "no stored SOXL/SOXS data; stored row decision/symbol was not a "
+                    "bullish TNA or bearish TZA pair, so the previous summary omitted this candidate"
+                )
+            else:
+                context["bucket_reason"] = "no stored SOXL/SOXS data"
+        elif stored_agreement in AGREEMENT_VALUES:
+            context["semiconductor_agreement"] = stored_agreement
+            context["bucket_reason"] = context.get("bucket_reason") or "no stored SOXL/SOXS data"
+        else:
+            context["semiconductor_agreement"] = None
+            context["exclusion_reason"] = "not a bullish TNA or bearish TZA candidate"
+            context["bucket_reason"] = context["exclusion_reason"]
+        return context
+    if context.get("semiconductor_agreement") not in AGREEMENT_VALUES and _eligible(decision, symbol):
+        context["semiconductor_agreement"] = _agreement(
+            decision, symbol, str(context.get("semiconductor_direction") or DIRECTION_UNAVAILABLE)
+        )
+        context["bucket_reason"] = "agreement assigned from the replayed candidate"
+    elif not context.get("bucket_reason"):
+        context["bucket_reason"] = "classified from stored semiconductor quotes"
+    return context
+
+
+def _outcome_status(flag: Optional[bool]) -> str:
+    if flag is True:
+        return "correct"
+    if flag is False:
+        return "incorrect"
+    return "unlabeled"
+
+
 def summarize_semiconductor(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -165,14 +300,31 @@ def summarize_semiconductor(
     }
     winners_agree = losers_agree = winners_disagree = losers_disagree = 0
     soxl_obs = soxl_agree = soxs_obs = soxs_agree = 0
-    for record in records:
-        context = record.get("semiconductor_context")
-        if not isinstance(context, dict):
-            context = context_from_row(record)
-        agreement = context.get("semiconductor_agreement")
-        if agreement not in buckets:
-            continue
+    excluded: List[Dict[str, Any]] = []
+    details: List[Dict[str, Any]] = []
+    labeled_records = [record for record in records if record.get(correct_key) is not None]
+    for record in labeled_records:
+        context = _resolve_context(record)
+        identity = _candidate_identity(record)
         flag = record.get(correct_key)
+        agreement = context.get("semiconductor_agreement")
+        detail = {
+            **identity,
+            "outcome_60s": _outcome_status(flag if isinstance(flag, bool) or flag is None else None),
+            "semiconductor_direction": context.get("semiconductor_direction"),
+            "semiconductor_agreement": agreement,
+            "fields_present": bool(context.get("fields_present")),
+            "bucket_reason": context.get("bucket_reason"),
+        }
+        if agreement not in buckets:
+            reason = str(context.get("exclusion_reason") or context.get("bucket_reason") or "semiconductor_agreement missing")
+            detail["bucket"] = "excluded"
+            detail["bucket_reason"] = reason
+            excluded.append(detail)
+            details.append(detail)
+            continue
+        detail["bucket"] = agreement
+        details.append(detail)
         buckets[agreement]["count"] += 1
         if flag is True:
             buckets[agreement]["correct"] += 1
@@ -186,8 +338,6 @@ def summarize_semiconductor(
             winners_disagree += 1
         elif agreement == DISAGREE and flag is False:
             losers_disagree += 1
-        if flag is None:
-            continue
         qqq = _sign(context.get("qqq_window_move_pct"))
         soxl = _sign(context.get("soxl_window_move_pct"))
         soxs = _sign(context.get("soxs_window_move_pct"))
@@ -197,9 +347,26 @@ def summarize_semiconductor(
         if qqq and soxs:
             soxs_obs += 1
             soxs_agree += int((-soxs) == qqq)
-    total = len(records)
+    labeled_count = len(labeled_records)
+    accounted = (
+        buckets[AGREE]["count"]
+        + buckets[DISAGREE]["count"]
+        + buckets[DIRECTION_MIXED]["count"]
+        + buckets[DIRECTION_UNAVAILABLE]["count"]
+        + len(excluded)
+    )
     disagree = buckets[DISAGREE]["count"]
-    kept = total - disagree
+    kept = labeled_count - disagree
+    accounting = {
+        "labeled_candidates": labeled_count,
+        "agree": buckets[AGREE]["count"],
+        "disagree": buckets[DISAGREE]["count"],
+        "mixed": buckets[DIRECTION_MIXED]["count"],
+        "unavailable": buckets[DIRECTION_UNAVAILABLE]["count"],
+        "excluded": len(excluded),
+        "accounted_total": accounted,
+        "accounting_valid": accounted == labeled_count,
+    }
     result: Dict[str, Any] = {
         "analytics_only": True,
         "strategy_impact": "none",
@@ -221,8 +388,11 @@ def summarize_semiconductor(
         "if_semiconductor_disagreement_had_blocked_candidate": {
             "winners_removed": winners_disagree,
             "losers_removed": losers_disagree,
-            "candidate_retention_pct": round(kept / total * 100.0, 1) if total else None,
+            "candidate_retention_pct": round(kept / labeled_count * 100.0, 1) if labeled_count else None,
         },
+        "semiconductor_candidate_accounting": accounting,
+        "excluded_candidates": excluded,
+        "candidates": details,
         "qqq_overlap": {
             "soxl_vs_qqq_agreement_count": soxl_agree,
             "soxl_vs_qqq_observations": soxl_obs,
@@ -280,6 +450,31 @@ def semiconductor_report_lines(block: Optional[Mapping[str, Any]]) -> Iterable[s
         f"{overlap.get('soxs_inverse_vs_qqq_observations', 0)} "
         f"pct={_pct_text(overlap.get('soxs_inverse_vs_qqq_agreement_pct'))}"
     )
+    accounting = data.get("semiconductor_candidate_accounting") or {}
+    lines.append("semiconductor_candidate_accounting:")
+    lines.append(f"  labeled_candidates: {accounting.get('labeled_candidates', 0)}")
+    lines.append(f"  agree: {accounting.get('agree', 0)}")
+    lines.append(f"  disagree: {accounting.get('disagree', 0)}")
+    lines.append(f"  mixed: {accounting.get('mixed', 0)}")
+    lines.append(f"  unavailable: {accounting.get('unavailable', 0)}")
+    lines.append(f"  excluded: {accounting.get('excluded', 0)}")
+    lines.append(f"  accounted_total: {accounting.get('accounted_total', 0)}")
+    lines.append(f"  accounting_valid: {str(bool(accounting.get('accounting_valid'))).lower()}")
+    lines.append("semiconductor_candidates:")
+    candidates = data.get("candidates") or []
+    if not candidates:
+        lines.append("  none")
+    for item in candidates:
+        lines.append(
+            "  "
+            f"run_id={item.get('run_id')} session_date={item.get('session_date') or 'n/a'} "
+            f"cycle={item.get('cycle')} symbol={item.get('symbol')} direction={item.get('direction')} "
+            f"outcome_60s={item.get('outcome_60s')} "
+            f"semiconductor_direction={item.get('semiconductor_direction')} "
+            f"semiconductor_agreement={item.get('semiconductor_agreement')} "
+            f"fields_present={str(bool(item.get('fields_present'))).lower()} "
+            f"bucket={item.get('bucket')} reason={item.get('bucket_reason')}"
+        )
     return lines
 
 

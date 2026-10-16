@@ -149,6 +149,90 @@ def test_disagreement_block_is_counterfactual_only():
     assert summary["qqq_overlap"]["soxs_inverse_vs_qqq_agreement_count"] == 1
 
 
+def _old_candidate(cycle: int, *, agreement=None, direction="bullish", symbol="TNA", correct=True):
+    context = {
+        "soxl_window_move_pct": None,
+        "soxs_window_move_pct": None,
+        "semiconductor_direction": "UNAVAILABLE",
+        "semiconductor_agreement": agreement,
+        "analytics_only": True,
+        "strategy_impact": "none",
+    }
+    return {
+        "run_id": "shadow-old",
+        "session_date": "2026-10-08",
+        "cycle": cycle,
+        "symbol": symbol,
+        "direction": direction,
+        "direction_correct_60s": correct,
+        "semiconductor_context": context,
+    }
+
+
+def test_old_candidate_without_semiconductor_fields_is_unavailable():
+    row = {
+        "run_id": "shadow-old",
+        "decision": "bullish",
+        "selected_symbol": "TNA",
+        "direction_correct_60s": True,
+        "raw_snapshot_json": snap(*window_bull()).to_dict(),
+    }
+    summary = summarize_semiconductor([row])
+    accounting = summary["semiconductor_candidate_accounting"]
+    assert summary["UNAVAILABLE"]["count"] == 1
+    assert accounting["unavailable"] == 1
+    assert accounting["excluded"] == 0
+    assert accounting["accounted_total"] == 1
+    assert accounting["accounting_valid"] is True
+    assert summary["candidates"][0]["fields_present"] is False
+    assert summary["candidates"][0]["bucket"] == "UNAVAILABLE"
+
+
+def test_null_agreement_is_counted_instead_of_dropped():
+    """The previous summary skipped a null agreement. Those candidates stay in UNAVAILABLE."""
+    rows = [_old_candidate(index, agreement="UNAVAILABLE") for index in range(1, 7)]
+    rows.append(_old_candidate(7, agreement=None))
+    rows.append(_old_candidate(8, agreement=None, direction="bearish", symbol="TZA", correct=False))
+    summary = summarize_semiconductor(rows)
+    accounting = summary["semiconductor_candidate_accounting"]
+    assert summary["UNAVAILABLE"]["count"] == 8
+    assert summary["strategy_impact"] == "none"
+    assert summary["orders_submitted"] == 0
+    assert accounting["labeled_candidates"] == 8
+    assert accounting["agree"] + accounting["disagree"] + accounting["mixed"] + accounting["unavailable"] == 8
+    assert accounting["excluded"] == 0
+    assert accounting["accounted_total"] == 8
+    assert accounting["accounting_valid"] is True
+    omitted = [item for item in summary["candidates"] if item["cycle"] in (7, 8)]
+    assert len(omitted) == 2
+    assert all(item["bucket"] == "UNAVAILABLE" for item in omitted)
+    assert all("omitted" in item["bucket_reason"] for item in omitted)
+
+
+def test_bucket_total_matches_labeled_candidates_when_one_row_is_excluded():
+    rows = [_old_candidate(1)]
+    rows.append(
+        {
+            "run_id": "shadow-old",
+            "cycle": 2,
+            "symbol": "SPY",
+            "direction": "skip",
+            "direction_correct_60s": True,
+            "semiconductor_context": {"semiconductor_direction": "UNAVAILABLE", "semiconductor_agreement": None},
+        }
+    )
+    summary = summarize_semiconductor(rows)
+    accounting = summary["semiconductor_candidate_accounting"]
+    assert accounting["excluded"] == 1
+    assert accounting["unavailable"] == 1
+    assert accounting["accounted_total"] == accounting["labeled_candidates"] == 2
+    assert accounting["accounting_valid"] is True
+    excluded = summary["excluded_candidates"][0]
+    assert excluded["cycle"] == 2
+    assert excluded["bucket"] == "excluded"
+    assert "not a bullish TNA or bearish TZA" in excluded["bucket_reason"]
+
+
 def test_semiconductor_analytics_are_not_an_execution_path():
     import backend.shadow_mode.semiconductor_context as context_mod
 

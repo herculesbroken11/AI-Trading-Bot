@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 from backend.shadow_mode.analytics import followup_move, pct_move
 from backend.shadow_mode.profile_replay import _ordered_rows, _remember_direction, replay_profile_row
 from backend.shadow_mode.session_quality import BAD_SESSION_LABELS, effective_session_label, group_stats, window_quality
-from backend.shadow_mode.semiconductor_context import context_from_row, summarize_semiconductor
+from backend.shadow_mode.semiconductor_context import context_for_candidate, summarize_semiconductor
 from backend.shadow_mode.stream_readiness import summarize_liveness
 from backend.signals.candidate_quality_ranker import rank_candidate
 from backend.signals.models import MarketSnapshot, SymbolQuote
@@ -508,7 +508,7 @@ def build_validation_dataset(
             "score_band": _score_band(None if candidate_score is None else float(candidate_score)),
             "vix_band": _vix_band(level),
             "probability_band": _probability_band(None if continuation is None else continuation.continuation_probability),
-            "semiconductor_context": context_from_row(row),
+            "semiconductor_context": context_for_candidate(row, decision=decision, symbol=str(symbol)),
         }
         if row.get("session_is_regular_hours") is not None:
             record["regular_hours"] = bool(row.get("session_is_regular_hours"))
